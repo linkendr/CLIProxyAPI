@@ -672,6 +672,11 @@ func usesPrevalidatedCandidates(selector Selector) bool {
 }
 
 func selectionArgForSelector(selector Selector, routeModel string) string {
+	// EarliestResetSelector reads the requested model's reset data, so it gets the model.
+	// Candidates are still prevalidated via selectorContextForAvailableAuths.
+	if _, ok := selector.(*EarliestResetSelector); ok {
+		return routeModel
+	}
 	if usesPrevalidatedCandidates(selector) {
 		return ""
 	}
