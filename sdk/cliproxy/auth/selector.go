@@ -83,6 +83,7 @@ const (
 type modelCooldownError struct {
 	model    string
 	resetIn  time.Duration
+	resetAt  time.Time
 	provider string
 	cause    error
 }
@@ -104,6 +105,7 @@ func newModelCooldownErrorWithCause(model, provider string, resetIn time.Duratio
 		model:    model,
 		provider: provider,
 		resetIn:  resetIn,
+		resetAt:  time.Now().Add(resetIn),
 		cause:    cause,
 	}
 }
@@ -358,6 +360,13 @@ func (e *modelCooldownError) Headers() http.Header {
 		resetSeconds = 0
 	}
 	headers.Set("Retry-After", strconv.Itoa(resetSeconds))
+	// Claude Code builds rate_limit_event.resetsAt from these two headers.
+	resetAt := e.resetAt
+	if resetAt.IsZero() {
+		resetAt = time.Now().Add(e.resetIn)
+	}
+	headers.Set("anthropic-ratelimit-unified-status", "rejected")
+	headers.Set("anthropic-ratelimit-unified-reset", strconv.FormatInt(resetAt.Unix(), 10))
 	return headers
 }
 
