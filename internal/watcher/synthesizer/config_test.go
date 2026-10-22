@@ -282,6 +282,26 @@ func TestConfigSynthesizer_ClaudeKeys(t *testing.T) {
 	}
 }
 
+func TestConfigSynthesizer_ClaudeKeys_FallbackWhen(t *testing.T) {
+	auths, err := NewConfigSynthesizer().Synthesize(&SynthesisContext{
+		Config: &config.Config{ClaudeKey: []config.ClaudeKey{
+			{APIKey: "on", Priority: -10, FallbackWhen: " Model-Limit "},
+			{APIKey: "off"},
+		}},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	})
+	if err != nil || len(auths) != 2 {
+		t.Fatalf("synthesize: auths=%d err=%v", len(auths), err)
+	}
+	if got := auths[0].Attributes["fallback_when"]; got != "model-limit" {
+		t.Fatalf("fallback_when = %q, want model-limit", got)
+	}
+	if value, exists := auths[1].Attributes["fallback_when"]; exists {
+		t.Fatalf("fallback_when = %q, want absent by default", value)
+	}
+}
+
 func TestConfigSynthesizer_ClaudeKeys_NativeToolSearchDefaultOff(t *testing.T) {
 	auths, err := NewConfigSynthesizer().Synthesize(&SynthesisContext{
 		Config:      &config.Config{ClaudeKey: []config.ClaudeKey{{APIKey: "key", BaseURL: "https://gateway.example.com"}}},

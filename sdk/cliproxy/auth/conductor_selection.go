@@ -566,6 +566,13 @@ func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, pro
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
+	// A conditional fallback that is not eligible behaves as if it were not configured,
+	// so the error below reflects only the credentials that can actually serve the model.
+	auths = m.filterModelLimitFallbacks(auths, routeModel, now)
+	if len(auths) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
+	}
+
 	availableByPriority := make(map[int][]*Auth)
 	cooldownCount := 0
 	unauthorizedCount := 0
@@ -701,6 +708,9 @@ func (m *Manager) transientlyUnavailableSessionAffinityAuthIDs(selector Selector
 	if !ok || affinity == nil || !affinity.rebindOnQuotaOnly || len(affinityCandidates) == 0 {
 		return nil
 	}
+	// An ineligible conditional fallback is not a candidate, so a stale binding to it
+	// must not be preserved as "transiently unavailable".
+	affinityCandidates = m.filterModelLimitFallbacks(affinityCandidates, routeModel, now)
 	if _, weighted := affinity.fallback.(*WeightedRoundRobinSelector); weighted {
 		affinityCandidates = positiveWeightAuths(affinityCandidates)
 	}
@@ -1824,7 +1834,15 @@ func (m *Manager) advanceSyncedVersion(version uint64) {
 }
 
 func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) bool {
-	if auth == nil || strings.TrimSpace(routeModel) == "" {
+	if auth == nil {
+		return false
+	}
+	// Conditional fallbacks need the manager-level view of their higher-priority peers,
+	// which the scheduler fast path does not have.
+	if authFallbackWhenModelLimit(auth) {
+		return true
+	}
+	if strings.TrimSpace(routeModel) == "" {
 		return false
 	}
 	return m.selectionModelKeyForAuth(auth, routeModel) != canonicalModelKey(routeModel)
