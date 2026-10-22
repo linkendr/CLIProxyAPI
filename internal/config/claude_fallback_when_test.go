@@ -16,6 +16,8 @@ func TestNormalizeClaudeFallbackWhen(t *testing.T) {
 		{"  ", "", true},
 		{"model-limit", ClaudeFallbackWhenModelLimit, true},
 		{" Model-Limit ", ClaudeFallbackWhenModelLimit, true},
+		{"limit", ClaudeFallbackWhenLimit, true},
+		{" Limit ", ClaudeFallbackWhenLimit, true},
 		{"model_limit", "", false},
 		{"always", "", false},
 	} {

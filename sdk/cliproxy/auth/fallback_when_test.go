@@ -28,6 +28,17 @@ type fallbackTestRig struct {
 // credit key (priority -10, Fable only). withOption controls the fallback-when attribute.
 func newFallbackTestRig(t *testing.T, name string, selector func() Selector, mixed, withOption, oauthDisabled bool) *fallbackTestRig {
 	t.Helper()
+	mode := ""
+	if withOption {
+		mode = FallbackWhenModelLimit
+	}
+	return newFallbackTestRigMode(t, name, selector, mixed, mode, oauthDisabled, []string{fallbackTestFable})
+}
+
+// newFallbackTestRigMode is newFallbackTestRig with an explicit fallback-when mode ("" for
+// none) and the models the credit key supports.
+func newFallbackTestRigMode(t *testing.T, name string, selector func() Selector, mixed bool, mode string, oauthDisabled bool, keyModels []string) *fallbackTestRig {
+	t.Helper()
 	ctx := context.Background()
 	provider := "fallback-" + name
 	manager := NewManager(nil, nil, nil)
@@ -40,15 +51,15 @@ func newFallbackTestRig(t *testing.T, name string, selector func() Selector, mix
 
 	rig := &fallbackTestRig{manager: manager, provider: provider, oauthID: provider + "-oauth", keyID: provider + "-key"}
 	keyAttrs := map[string]string{"priority": "-10"}
-	if withOption {
-		keyAttrs[AttributeFallbackWhen] = FallbackWhenModelLimit
+	if mode != "" {
+		keyAttrs[AttributeFallbackWhen] = mode
 	}
 	for _, entry := range []struct {
 		auth   *Auth
 		models []string
 	}{
 		{&Auth{ID: rig.oauthID, Provider: provider, Status: StatusActive, Disabled: oauthDisabled}, []string{fallbackTestFable, fallbackTestOpus}},
-		{&Auth{ID: rig.keyID, Provider: provider, Status: StatusActive, Attributes: keyAttrs}, []string{fallbackTestFable}},
+		{&Auth{ID: rig.keyID, Provider: provider, Status: StatusActive, Attributes: keyAttrs}, keyModels},
 	} {
 		if _, err := manager.Register(WithSkipPersist(ctx), entry.auth); err != nil {
 			t.Fatalf("Register(%s): %v", entry.auth.ID, err)
@@ -119,6 +130,15 @@ func fallbackSelectors() map[string]func() Selector {
 
 func forEachFallbackRig(t *testing.T, withOption, oauthDisabled bool, run func(t *testing.T, rig *fallbackTestRig)) {
 	t.Helper()
+	mode := ""
+	if withOption {
+		mode = FallbackWhenModelLimit
+	}
+	forEachFallbackRigMode(t, mode, oauthDisabled, []string{fallbackTestFable}, run)
+}
+
+func forEachFallbackRigMode(t *testing.T, mode string, oauthDisabled bool, keyModels []string, run func(t *testing.T, rig *fallbackTestRig)) {
+	t.Helper()
 	for selectorName, selector := range fallbackSelectors() {
 		for _, mixed := range []bool{false, true} {
 			name := selectorName + "-single"
@@ -126,7 +146,7 @@ func forEachFallbackRig(t *testing.T, withOption, oauthDisabled bool, run func(t
 				name = selectorName + "-mixed"
 			}
 			t.Run(name, func(t *testing.T) {
-				run(t, newFallbackTestRig(t, name, selector, mixed, withOption, oauthDisabled))
+				run(t, newFallbackTestRigMode(t, name, selector, mixed, mode, oauthDisabled, keyModels))
 			})
 		}
 	}
@@ -205,7 +225,7 @@ func TestFallbackWhenModelLimitRequiresAHigherPriorityCredential(t *testing.T) {
 	key := &Auth{ID: "fallback-lone-key", Provider: "claude", Attributes: map[string]string{AttributeFallbackWhen: FallbackWhenModelLimit, "priority": "-10"}}
 	manager.mu.Lock()
 	manager.auths[key.ID] = key
-	eligible := manager.modelLimitFallbackEligible(key, fallbackTestFable, time.Now())
+	eligible := manager.conditionalFallbackEligible(key, fallbackTestFable, time.Now())
 	manager.mu.Unlock()
 	if eligible {
 		t.Fatal("lone fallback credential is eligible without a higher-priority credential")
@@ -275,5 +295,98 @@ func TestFallbackWhenModelLimitIgnoresUnrelatedDisabledPeer(t *testing.T) {
 
 		rig.fail(fallbackTestFable, 5*24*time.Hour, false)
 		requireFallbackPick(t, rig, "s1", fallbackTestFable, rig.keyID)
+	})
+}
+
+var fallbackAllModels = []string{fallbackTestFable, fallbackTestOpus}
+
+func TestFallbackWhenLimitServesKeyOnFiveHourLimitForAllModels(t *testing.T) {
+	forEachFallbackRigMode(t, FallbackWhenLimit, false, fallbackAllModels, func(t *testing.T, rig *fallbackTestRig) {
+		requireFallbackPick(t, rig, "s1", fallbackTestOpus, rig.oauthID)
+		rig.fail(fallbackTestOpus, 4*time.Hour, true)
+		requireFallbackPick(t, rig, "s1", fallbackTestOpus, rig.keyID)
+		requireFallbackPick(t, rig, "s2", fallbackTestFable, rig.keyID)
+		requireFallbackPick(t, rig, "s3", fallbackTestOpus, rig.keyID)
+	})
+}
+
+func TestFallbackWhenLimitServesKeyOnSharedSevenDayLimit(t *testing.T) {
+	forEachFallbackRigMode(t, FallbackWhenLimit, false, fallbackAllModels, func(t *testing.T, rig *fallbackTestRig) {
+		rig.fail(fallbackTestFable, 6*24*time.Hour, true)
+		requireFallbackPick(t, rig, "s1", fallbackTestFable, rig.keyID)
+		requireFallbackPick(t, rig, "s2", fallbackTestOpus, rig.keyID)
+	})
+}
+
+func TestFallbackWhenLimitServesKeyOnFableModelScopedLimit(t *testing.T) {
+	forEachFallbackRigMode(t, FallbackWhenLimit, false, fallbackAllModels, func(t *testing.T, rig *fallbackTestRig) {
+		rig.fail(fallbackTestFable, 5*24*time.Hour, false)
+		requireFallbackPick(t, rig, "s1", fallbackTestFable, rig.keyID)
+		// The Fable window does not block Opus, so Max keeps serving it.
+		requireFallbackPick(t, rig, "s1", fallbackTestOpus, rig.oauthID)
+	})
+}
+
+func TestFallbackWhenLimitIgnoredWhenHigherPriorityDisabled(t *testing.T) {
+	forEachFallbackRigMode(t, FallbackWhenLimit, true, fallbackAllModels, func(t *testing.T, rig *fallbackTestRig) {
+		if got, err := rig.pick(fallbackSessionOpts("s1"), fallbackTestOpus); err == nil {
+			t.Fatalf("pick selected %v with the only higher-priority credential disabled, want an error", got)
+		}
+	})
+}
+
+func TestFallbackWhenLimitIgnoredWhenHigherPriorityHealthy(t *testing.T) {
+	forEachFallbackRigMode(t, FallbackWhenLimit, false, fallbackAllModels, func(t *testing.T, rig *fallbackTestRig) {
+		requireFallbackPick(t, rig, "s1", fallbackTestOpus, rig.oauthID)
+		requireFallbackPick(t, rig, "s2", fallbackTestFable, rig.oauthID)
+	})
+}
+
+func TestFallbackWhenLimitIgnoredOnNonQuotaFailure(t *testing.T) {
+	forEachFallbackRigMode(t, FallbackWhenLimit, false, fallbackAllModels, func(t *testing.T, rig *fallbackTestRig) {
+		retry := time.Hour
+		rig.manager.MarkResult(context.Background(), Result{
+			AuthID: rig.oauthID, Provider: rig.provider, Model: fallbackTestOpus, Success: false, RetryAfter: &retry,
+			Error: &Error{HTTPStatus: http.StatusServiceUnavailable, Message: "upstream down"},
+		})
+		got, err := rig.pick(fallbackSessionOpts("s1"), fallbackTestOpus)
+		if err == nil && got != nil && got.ID == rig.keyID {
+			t.Fatal("key served a model blocked by a non-quota failure")
+		}
+	})
+}
+
+func TestFallbackWhenLimitRebindsToOAuthOnRecovery(t *testing.T) {
+	forEachFallbackRigMode(t, FallbackWhenLimit, false, fallbackAllModels, func(t *testing.T, rig *fallbackTestRig) {
+		rig.fail(fallbackTestOpus, 4*time.Hour, true)
+		requireFallbackPick(t, rig, "s1", fallbackTestOpus, rig.keyID)
+		requireFallbackPick(t, rig, "s1", fallbackTestFable, rig.keyID)
+
+		rig.expire(t, fallbackTestOpus)
+		requireFallbackPick(t, rig, "s1", fallbackTestOpus, rig.oauthID)
+		requireFallbackPick(t, rig, "s1", fallbackTestFable, rig.oauthID)
+		requireFallbackPick(t, rig, "s2", fallbackTestOpus, rig.oauthID)
+	})
+}
+
+func TestFallbackWhenLimitIgnoresUnrelatedDisabledPeer(t *testing.T) {
+	forEachFallbackRigMode(t, FallbackWhenLimit, false, fallbackAllModels, func(t *testing.T, rig *fallbackTestRig) {
+		unrelatedID := rig.provider + "-unrelated"
+		unrelated := &Auth{ID: unrelatedID, Provider: rig.provider, Status: StatusActive, Disabled: true, Attributes: map[string]string{"priority": "5"}}
+		if _, err := rig.manager.Register(WithSkipPersist(context.Background()), unrelated); err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(unrelatedID, rig.provider, []*registry.ModelInfo{{ID: "fallback-unrelated-model"}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(unrelatedID) })
+
+		rig.fail(fallbackTestOpus, 4*time.Hour, true)
+		requireFallbackPick(t, rig, "s1", fallbackTestOpus, rig.keyID)
+	})
+}
+
+func TestFallbackWhenModelLimitStillIgnoredOnFiveHourLimitWithAllModels(t *testing.T) {
+	forEachFallbackRigMode(t, FallbackWhenModelLimit, false, fallbackAllModels, func(t *testing.T, rig *fallbackTestRig) {
+		rig.fail(fallbackTestOpus, 4*time.Hour, true)
+		requireFallbackCooldown(t, rig, "s1", fallbackTestOpus)
 	})
 }

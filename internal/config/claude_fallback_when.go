@@ -10,6 +10,12 @@ import (
 // model-scoped limit (for example the Fable weekly window).
 const ClaudeFallbackWhenModelLimit = "model-limit"
 
+// ClaudeFallbackWhenLimit marks a Claude key that serves a model only while every
+// higher-priority credential supporting it is blocked for that model by a quota
+// limit of either scope: model-scoped (Fable weekly window) or credential-wide
+// (shared 5h or 7d window).
+const ClaudeFallbackWhenLimit = "limit"
+
 // NormalizeClaudeFallbackWhen maps a raw fallback-when value to its canonical form.
 // The boolean is false for an unsupported value.
 func NormalizeClaudeFallbackWhen(raw string) (string, bool) {
@@ -18,6 +24,8 @@ func NormalizeClaudeFallbackWhen(raw string) (string, bool) {
 		return "", true
 	case ClaudeFallbackWhenModelLimit:
 		return ClaudeFallbackWhenModelLimit, true
+	case ClaudeFallbackWhenLimit:
+		return ClaudeFallbackWhenLimit, true
 	default:
 		return "", false
 	}
@@ -31,7 +39,7 @@ func (cfg *Config) ValidateClaudeFallbackWhen() error {
 	}
 	for index := range cfg.ClaudeKey {
 		if _, ok := NormalizeClaudeFallbackWhen(cfg.ClaudeKey[index].FallbackWhen); !ok {
-			return fmt.Errorf("claude-api-key[%d].fallback-when: unsupported value %q (supported: %q or empty)", index, strings.TrimSpace(cfg.ClaudeKey[index].FallbackWhen), ClaudeFallbackWhenModelLimit)
+			return fmt.Errorf("claude-api-key[%d].fallback-when: unsupported value %q (supported: %q, %q or empty)", index, strings.TrimSpace(cfg.ClaudeKey[index].FallbackWhen), ClaudeFallbackWhenModelLimit, ClaudeFallbackWhenLimit)
 		}
 	}
 	return nil
