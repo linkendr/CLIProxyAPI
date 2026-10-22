@@ -61,8 +61,14 @@ func (m *Manager) modelLimitFallbackEligible(fallback *Auth, routeModel string, 
 			continue
 		}
 		disabled := peer.Disabled || peer.Status == StatusDisabled
-		if !disabled && !m.authSupportsRouteModel(registryRef, peer, routeModel) {
-			continue
+		if !m.authSupportsRouteModel(registryRef, peer, routeModel) {
+			// A disabled credential is often unregistered, so its model support is unknown
+			// and it still vetoes the fallback. Only a registered list that lacks the
+			// model proves the peer unrelated.
+			registered, _ := registryRef.GetModelsAndEpochForClient(peer.ID)
+			if !disabled || len(registered) > 0 {
+				continue
+			}
 		}
 		peers++
 		if disabled || !blockedOnlyByModelQuota(peer, m.selectionModelForAuth(peer, routeModel), now) {

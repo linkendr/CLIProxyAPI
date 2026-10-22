@@ -262,3 +262,18 @@ func TestBlockedOnlyByModelQuotaRejectsSharedWindowSignals(t *testing.T) {
 		t.Fatal("a block on another model must not count")
 	}
 }
+
+func TestFallbackWhenModelLimitIgnoresUnrelatedDisabledPeer(t *testing.T) {
+	forEachFallbackRig(t, true, false, func(t *testing.T, rig *fallbackTestRig) {
+		unrelatedID := rig.provider + "-unrelated"
+		unrelated := &Auth{ID: unrelatedID, Provider: rig.provider, Status: StatusActive, Disabled: true, Attributes: map[string]string{"priority": "5"}}
+		if _, err := rig.manager.Register(WithSkipPersist(context.Background()), unrelated); err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+		registry.GetGlobalRegistry().RegisterClient(unrelatedID, rig.provider, []*registry.ModelInfo{{ID: "fallback-unrelated-model"}})
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(unrelatedID) })
+
+		rig.fail(fallbackTestFable, 5*24*time.Hour, false)
+		requireFallbackPick(t, rig, "s1", fallbackTestFable, rig.keyID)
+	})
+}
