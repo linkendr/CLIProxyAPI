@@ -568,7 +568,7 @@ func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, pro
 
 	// A conditional fallback that is not eligible behaves as if it were not configured,
 	// so the error below reflects only the credentials that can actually serve the model.
-	auths = m.filterModelLimitFallbacks(auths, routeModel, now)
+	auths = m.filterConditionalFallbacks(auths, routeModel, now)
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
@@ -710,7 +710,7 @@ func (m *Manager) transientlyUnavailableSessionAffinityAuthIDs(selector Selector
 	}
 	// An ineligible conditional fallback is not a candidate, so a stale binding to it
 	// must not be preserved as "transiently unavailable".
-	affinityCandidates = m.filterModelLimitFallbacks(affinityCandidates, routeModel, now)
+	affinityCandidates = m.filterConditionalFallbacks(affinityCandidates, routeModel, now)
 	if _, weighted := affinity.fallback.(*WeightedRoundRobinSelector); weighted {
 		affinityCandidates = positiveWeightAuths(affinityCandidates)
 	}
