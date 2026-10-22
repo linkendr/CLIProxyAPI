@@ -735,6 +735,16 @@ upstream:
 #         - api-key: "sk-atSM..."
 #           weight: 5 # optional: weighted-round-robin share; omitted defaults to 1; maximum 1,000,000
 #           rebuild-mid-system-message: false # optional: default is false; when true, move messages with role "system" into the top-level Claude system field
+#           # fallback-when (optional; claude only, key or group field): "model-limit" makes this key a conditional
+#           # fallback. It serves a model only while every higher-priority credential that supports that model is
+#           # blocked for THAT model by a model-scoped limit (for example the Fable weekly window, which Anthropic
+#           # reports as unified-7d_oi rejected while the shared 5h and 7d windows stay allowed). It is not used when a
+#           # higher-priority credential is blocked credential-wide (shared 5h or 7d limit), disabled, unauthorized, or
+#           # simply healthy, and it needs at least one higher-priority credential; in those cases it behaves as if it
+#           # were not configured. Session-affinity bindings to it end when it stops being eligible. Pair it with a
+#           # lower priority and a models list limited to the models you want it to cover. Omit for ordinary priority
+#           # selection; any other value is a configuration error.
+#           # fallback-when: model-limit
 #           native-tool-search: false # optional: default is false; when true, trust this key's custom base-url with Anthropic native tool search (defer_loading + tool_reference) for Codex tool_search; requires upstream.claude.tool-search: true
 #           cloak:                         # optional: explicitly enable request cloaking for non-Claude-Code clients
 #             mode: "auto"                 # "auto" (default inside this block): cloak only when client is not Claude Code

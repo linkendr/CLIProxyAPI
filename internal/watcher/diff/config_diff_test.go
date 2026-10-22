@@ -769,6 +769,12 @@ func TestTrimStrings(t *testing.T) {
 	}
 }
 
+func TestBuildConfigChangeDetails_ClaudeFallbackWhen(t *testing.T) {
+	oldCfg := &config.Config{ClaudeKey: []config.ClaudeKey{{APIKey: "key"}}}
+	newCfg := &config.Config{ClaudeKey: []config.ClaudeKey{{APIKey: "key", FallbackWhen: "model-limit"}}}
+	expectContains(t, BuildConfigChangeDetails(oldCfg, newCfg), "claude[0].fallback-when:  -> model-limit")
+}
+
 func TestBuildConfigChangeDetails_ClaudeNativeToolSearch(t *testing.T) {
 	oldCfg := &config.Config{ClaudeKey: []config.ClaudeKey{{APIKey: "key", BaseURL: "https://gateway.example.com"}}}
 	newCfg := &config.Config{ClaudeKey: []config.ClaudeKey{{APIKey: "key", BaseURL: "https://gateway.example.com", NativeToolSearch: true}}}

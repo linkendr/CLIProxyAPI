@@ -317,6 +317,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 			if o.NativeToolSearch != n.NativeToolSearch {
 				changes = append(changes, fmt.Sprintf("claude[%d].native-tool-search: %t -> %t", i, o.NativeToolSearch, n.NativeToolSearch))
 			}
+			if strings.TrimSpace(o.FallbackWhen) != strings.TrimSpace(n.FallbackWhen) {
+				changes = append(changes, fmt.Sprintf("claude[%d].fallback-when: %s -> %s", i, strings.TrimSpace(o.FallbackWhen), strings.TrimSpace(n.FallbackWhen)))
+			}
 			if strings.TrimSpace(o.FingerprintProfile) != strings.TrimSpace(n.FingerprintProfile) {
 				changes = append(changes, fmt.Sprintf("claude[%d].fingerprint-profile: %s -> %s", i, strings.TrimSpace(o.FingerprintProfile), strings.TrimSpace(n.FingerprintProfile)))
 			}

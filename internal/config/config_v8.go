@@ -353,7 +353,7 @@ func flattenV8(node *yaml.Node) (*yaml.Node, error) {
 var sharedKeyFields = map[string]bool{
 	"priority": true, "prefix": true, "proxy-url": true, "headers": true,
 	"models": true, "excluded-models": true, "disable-cooling": true,
-	"request-retry": true, "request-scoped-errors": true,
+	"request-retry": true, "request-scoped-errors": true, "fallback-when": true,
 }
 
 func expandV8Groups(groups *yaml.Node, provider string) (*yaml.Node, error) {
@@ -391,6 +391,9 @@ func expandV8Groups(groups *yaml.Node, provider string) (*yaml.Node, error) {
 			if field != "name" && field != "base-url" && field != "keys" && !sharedKeyFields[field] {
 				return nil, fmt.Errorf("api-keys.%s: unsupported group field %s", provider, field)
 			}
+			if field == "fallback-when" && provider != "claude" {
+				return nil, fmt.Errorf("api-keys.%s: unsupported group field %s", provider, field)
+			}
 		}
 		for _, key := range keys.Content {
 			if key.Kind != yaml.MappingNode {
@@ -398,6 +401,9 @@ func expandV8Groups(groups *yaml.Node, provider string) (*yaml.Node, error) {
 			}
 			if yamlPath(key, "base-url") != nil {
 				return nil, fmt.Errorf("api-keys.%s: base-url belongs to the group", provider)
+			}
+			if provider != "claude" && yamlPath(key, "fallback-when") != nil {
+				return nil, fmt.Errorf("api-keys.%s: fallback-when is only supported for claude", provider)
 			}
 			item := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
 			for i := 0; i < len(group.Content); i += 2 {

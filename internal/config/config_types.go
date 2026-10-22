@@ -636,6 +636,12 @@ type ClaudeKey struct {
 	// True disables auth/model cooldowns; false explicitly enables them.
 	DisableCooling *bool `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
 
+	// FallbackWhen makes this credential a conditional fallback. The only supported
+	// value is "model-limit": the credential serves a model only while every
+	// higher-priority credential that supports it is blocked for that model by a
+	// model-scoped limit. Empty keeps ordinary priority selection.
+	FallbackWhen string `yaml:"fallback-when,omitempty" json:"fallback-when,omitempty"`
+
 	// RequestRetry optionally overrides the global request-retry for this credential.
 	// Nil or a negative value means "use the global request-retry". 0 disables additional retry rounds.
 	RequestRetry *int `yaml:"request-retry,omitempty" json:"request-retry,omitempty"`
