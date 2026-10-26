@@ -311,7 +311,15 @@ func SafeResponseHeaders(err error) http.Header {
 	}
 	var upstream interface{ UpstreamRateLimitHeaders() http.Header }
 	if errors.As(err, &upstream) && upstream != nil {
-		return upstream.UpstreamRateLimitHeaders()
+		if headers := upstream.UpstreamRateLimitHeaders(); len(headers) > 0 {
+			return headers
+		}
+	}
+	var safeHeaderProvider interface{ SafeResponseHeaders() http.Header }
+	if errors.As(err, &safeHeaderProvider) && safeHeaderProvider != nil {
+		if value := safeHeaderProvider.SafeResponseHeaders().Get("Retry-After"); value != "" {
+			return http.Header{"Retry-After": []string{value}}
+		}
 	}
 	return nil
 }
