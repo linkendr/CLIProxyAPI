@@ -20,7 +20,7 @@ func TestManagerPickNextEarliestResetUsesRequestedModelReset(t *testing.T) {
 			Provider: "claude",
 			ModelStates: map[string]*ModelState{
 				model: {Quota: QuotaState{
-					Signals:    map[string]string{"Anthropic-Ratelimit-Unified-Reset": epoch(reset)},
+					Signals:    map[string]string{"Anthropic-Ratelimit-Unified-7d-Reset": epoch(reset)},
 					ObservedAt: now,
 				}},
 			},
