@@ -50,3 +50,5 @@ The upstream PR workflow `.github/workflows/pr-test-build.yml` runs only `go bui
 - TestClaudeExecutorManagerRetriesSilentTLSHandshakeThroughConnectProxy
 - TestDevinApplyPatchRejectionCarriesLogDiagnostic
 - TestResponsesSteeringFullDuplexIntegration
+
+Run the full suite with `bash scripts/test-in-container.sh`. It uses the Go version in `go.mod` inside a Linux container. On a developer Mac, local port scanners probe the tests' loopback servers and break four network tests, and Go 1.27 changes JSON error wording that one test checks.
