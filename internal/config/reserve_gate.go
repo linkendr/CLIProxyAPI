@@ -10,6 +10,9 @@ import (
 const (
 	DefaultReserveGateThreshold   = 0.95
 	DefaultReserveGateResumeBelow = 0.90
+	// DefaultReserveGateStateFileName is the state file kept in auth-dir. It is not a
+	// .json file, so the auth watcher and loader never read it as a credential.
+	DefaultReserveGateStateFileName = "reserve-gate.state"
 )
 
 // ReserveGateConfig keeps the last part of every Claude account's 5-hour and 7-day
@@ -32,6 +35,9 @@ type ReserveGateConfig struct {
 	ResumeBelow float64 `yaml:"resume-below,omitempty" json:"resume-below,omitempty"`
 	// ExemptAPIKeys lists the client keys (access api-keys) the gate never applies to.
 	ExemptAPIKeys []string `yaml:"exempt-api-keys,omitempty" json:"exempt-api-keys,omitempty"`
+	// StateFile is where the gate keeps its last readings and holds so a restart does
+	// not forget them. Empty means DefaultReserveGateStateFileName in auth-dir.
+	StateFile string `yaml:"state-file,omitempty" json:"state-file,omitempty"`
 }
 
 // Levels returns the effective threshold and resume level after defaults.
