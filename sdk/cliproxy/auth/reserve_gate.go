@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"net/http"
 	"strconv"
@@ -305,7 +306,47 @@ func formatReserveReset(t time.Time) string {
 }
 
 // pickHomeDispatchSelection is every Home dispatch: Home picks the credential, and the
-// reserve gate applies to its pick.
+// reserve gate applies to its pick. A credential the gate keeps from the caller is
+// released back to Home and excluded, and Home is asked again. When Home has nothing
+// left after the gate removed at least one credential, the request gets the reserve
+// hold error. Under Home the utilization readings are the quota snapshot Home sends
+// with the credential, since results are reported to Home.
 func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, opts cliproxyexecutor.Options) (*HomeDispatchSelection, error) {
-	return m.dispatchHomeSelection(ctx, model, opts)
+	reserve := m.reserveCheckFor(opts.Metadata)
+	if reserve == nil {
+		return m.dispatchHomeSelection(ctx, model, opts)
+	}
+	excluded := make(map[string]struct{})
+	var gated []*Auth
+	for {
+		selection, errSelection := m.dispatchHomeSelection(ctx, model, withHomeExcludedAuthIDs(opts, excluded))
+		if errSelection != nil {
+			if len(gated) > 0 && homeDispatchExhausted(errSelection) {
+				return nil, reserve.holdError(gated)
+			}
+			return nil, errSelection
+		}
+		auth := selection.CloneAuth()
+		if !reserve.blocks(auth) {
+			return selection, nil
+		}
+		if errEnd := m.endHomeSelectionBeforeRedispatch(ctx, selection, "reserve_gate"); errEnd != nil {
+			return nil, errEnd
+		}
+		gated = append(gated, auth)
+		id := strings.TrimSpace(auth.ID)
+		if _, repeated := excluded[id]; repeated || id == "" {
+			// Home ignored the exclusion; asking again would loop.
+			return nil, reserve.holdError(gated)
+		}
+		excluded[id] = struct{}{}
+		opts = withHomeAuthCount(opts, homeAuthCountFromMetadata(opts.Metadata)+1)
+	}
+}
+
+// homeDispatchExhausted reports whether Home had no further credential for the request.
+// A cooldown is not exhaustion: it passes through so the Home retry round can wait it out.
+func homeDispatchExhausted(err error) bool {
+	var authErr *Error
+	return errors.As(err, &authErr) && authErr != nil && authErr.Code == "auth_not_found"
 }
