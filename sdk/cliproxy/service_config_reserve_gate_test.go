@@ -84,7 +84,12 @@ func TestReserveGateHotReloadFromConfigFile(t *testing.T) {
 	if _, err = manager.Register(coreauth.WithSkipPersist(context.Background()), auth); err != nil {
 		t.Fatal(err)
 	}
-	registry.GetGlobalRegistry().RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	// A reload rebuilds the model registry from the auths it loads, and this auth is not
+	// loaded from a file, so its model is registered again after each reload.
+	registerModel := func() {
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	}
+	registerModel()
 	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
 
 	opts := func(key string) cliproxyexecutor.Options {
@@ -102,6 +107,7 @@ func TestReserveGateHotReloadFromConfigFile(t *testing.T) {
 	if !service.reloadConfigFromWatcher() {
 		t.Fatal("reload did not run")
 	}
+	registerModel()
 	err = selectAs("interactive")
 	status := 0
 	if coder, ok := err.(interface{ StatusCode() int }); ok {
@@ -116,6 +122,7 @@ func TestReserveGateHotReloadFromConfigFile(t *testing.T) {
 
 	write("routing:\n  reserve-gate:\n    enabled: false\n")
 	service.reloadConfigFromWatcher()
+	registerModel()
 	if err = selectAs("interactive"); err != nil {
 		t.Fatalf("after disabling the gate: %v", err)
 	}

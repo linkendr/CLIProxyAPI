@@ -526,3 +526,39 @@ func TestReserveGateConfigReloadTogglesGate(t *testing.T) {
 		t.Fatalf("gate off again: %v", err)
 	}
 }
+
+// Without a credit key nothing else sends the round-robin rig off the scheduler fast
+// path, so this pins the gate's own detour: a held account is never handed out by the
+// scheduler, and an all-held pool gets the hold error, on single and mixed picks.
+func TestReserveGateOnSchedulerFastPathWithoutCreditKey(t *testing.T) {
+	for _, mixed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("mixed=%v", mixed), func(t *testing.T) {
+			rig := newReserveRig(t, &RoundRobinSelector{}, mixed, reserveGateOn(nil))
+			rig.manager.Remove(WithSkipPersist(context.Background()), rig.credit)
+			if !rig.manager.useSchedulerFastPath() {
+				t.Fatal("rig does not use the scheduler fast path")
+			}
+			rig.manager.mu.RLock()
+			for _, auth := range rig.manager.auths {
+				if auth != nil && rig.manager.routeAwareSelectionRequired(auth, reserveTestClaudeModel) {
+					rig.manager.mu.RUnlock()
+					t.Fatalf("%s forces the legacy path on its own", auth.ID)
+				}
+			}
+			rig.manager.mu.RUnlock()
+			if seen := rig.picked(t, reserveTestUserKey, 4); seen[rig.a]+seen[rig.b] != 4 || seen[rig.a] == 0 || seen[rig.b] == 0 {
+				t.Fatalf("picks with nothing held = %v, want both accounts", seen)
+			}
+			rig.observe(t, rig.a, "5h", 0.98, time.Now().Add(time.Hour))
+			if seen := rig.picked(t, reserveTestUserKey, 6); seen[rig.b] != 6 {
+				t.Fatalf("non-exempt picks = %v, want only %s", seen, rig.b)
+			}
+			if seen := rig.picked(t, reserveTestExemptKey, 4); seen[rig.a] == 0 {
+				t.Fatalf("exempt picks = %v, want %s still in rotation", seen, rig.a)
+			}
+			rig.observe(t, rig.b, "7d", 0.98, time.Now().Add(24*time.Hour))
+			_, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
+			requireReserveHold(t, err)
+		})
+	}
+}

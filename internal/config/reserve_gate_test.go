@@ -43,12 +43,12 @@ func TestParseConfigRejectsInvalidReserveGate(t *testing.T) {
 		gate string
 		want string
 	}{
-		"threshold above one":     {"enabled: true\n    threshold: 95", "threshold"},
-		"negative threshold":      {"enabled: true\n    threshold: -0.5", "threshold"},
-		"resume above threshold":  {"enabled: true\n    threshold: 0.9\n    resume-below: 0.95", "resume-below"},
-		"hold without enabled":    {"hold: true", "hold"},
-		"empty exempt key":        {"enabled: true\n    exempt-api-keys: ['']", "exempt-api-keys[0]"},
-		"negative resume-below":   {"enabled: true\n    resume-below: -0.1", "resume-below"},
+		"threshold above one":      {"enabled: true\n    threshold: 95", "threshold"},
+		"negative threshold":       {"enabled: true\n    threshold: -0.5", "threshold"},
+		"resume above threshold":   {"enabled: true\n    threshold: 0.9\n    resume-below: 0.95", "resume-below"},
+		"hold without enabled":     {"hold: true", "hold"},
+		"empty exempt key":         {"enabled: true\n    exempt-api-keys: ['']", "exempt-api-keys[0]"},
+		"negative resume-below":    {"enabled: true\n    resume-below: -0.1", "resume-below"},
 		"invalid even if disabled": {"threshold: 2", "threshold"},
 	} {
 		t.Run(name, func(t *testing.T) {
