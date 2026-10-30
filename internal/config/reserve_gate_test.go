@@ -60,3 +60,29 @@ func TestParseConfigRejectsInvalidReserveGate(t *testing.T) {
 		})
 	}
 }
+
+// The live config uses the v8 layout; routing.reserve-gate must survive it unchanged.
+func TestParseConfigReserveGateV8Layout(t *testing.T) {
+	raw := `config-version: 8
+server:
+  port: 8317
+access:
+  api-keys: [automation-key, interactive-key]
+routing:
+  strategy: earliest-reset
+  reserve-gate:
+    enabled: true
+    exempt-api-keys: [automation-key]
+`
+	cfg, err := ParseConfigBytes([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := cfg.Routing.ReserveGate
+	if !gate.Enabled || gate.Hold || len(gate.ExemptAPIKeys) != 1 || gate.ExemptAPIKeys[0] != "automation-key" {
+		t.Fatalf("reserve-gate = %+v", gate)
+	}
+	if cfg.Routing.Strategy != "earliest-reset" {
+		t.Fatalf("strategy = %q", cfg.Routing.Strategy)
+	}
+}
