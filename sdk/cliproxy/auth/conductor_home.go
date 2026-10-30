@@ -955,7 +955,7 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 	return auth, executor, provider, nil
 }
 
-func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, opts cliproxyexecutor.Options) (*HomeDispatchSelection, error) {
+func (m *Manager) dispatchHomeSelection(ctx context.Context, model string, opts cliproxyexecutor.Options) (*HomeDispatchSelection, error) {
 	if m == nil {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}

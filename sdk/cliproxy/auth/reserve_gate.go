@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"net/http"
@@ -301,4 +302,10 @@ func formatReserveReset(t time.Time) string {
 		return "unknown"
 	}
 	return t.UTC().Format(time.RFC3339)
+}
+
+// pickHomeDispatchSelection is every Home dispatch: Home picks the credential, and the
+// reserve gate applies to its pick.
+func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, opts cliproxyexecutor.Options) (*HomeDispatchSelection, error) {
+	return m.dispatchHomeSelection(ctx, model, opts)
 }
