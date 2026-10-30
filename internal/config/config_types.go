@@ -487,6 +487,9 @@ type RoutingConfig struct {
 	//     auth errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
 	// Ignored when SessionAffinity is false.
 	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
+
+	// ReserveGate keeps part of each Claude account's quota for exempt callers. Hot-reloadable.
+	ReserveGate ReserveGateConfig `yaml:"reserve-gate,omitempty" json:"reserve-gate,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
