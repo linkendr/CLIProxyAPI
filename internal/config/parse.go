@@ -58,6 +58,9 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	if errValidate := cfg.ValidateClaudeFallbackWhen(); errValidate != nil {
 		return nil, errValidate
 	}
+	if errValidate := cfg.Routing.ReserveGate.Validate(); errValidate != nil {
+		return nil, errValidate
+	}
 	if errValidate := cfg.Codex.LiveMediaRelay.Validate(); errValidate != nil {
 		return nil, errValidate
 	}

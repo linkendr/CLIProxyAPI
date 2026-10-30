@@ -312,6 +312,10 @@ func SafeResponseHeaders(err error) http.Header {
 	if errors.As(err, &modelCooldown) && modelCooldown != nil {
 		return modelCooldown.Headers()
 	}
+	var reserveHold *reserveHoldError
+	if errors.As(err, &reserveHold) && reserveHold != nil {
+		return reserveHold.Headers()
+	}
 	var unavailable *authUnavailableError
 	if errors.As(err, &unavailable) && unavailable != nil {
 		return unavailable.Headers()

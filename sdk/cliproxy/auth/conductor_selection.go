@@ -1940,6 +1940,8 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
+	reserve := m.reserveCheckFor(opts.Metadata)
+	var reserveGated []*Auth
 	pluginScheduler, schedulerAcross := m.snapshotPluginScheduler()
 
 	m.mu.RLock()
@@ -1980,6 +1982,12 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
+		if reserve.blocks(candidate) {
+			if _, used := tried[candidate.ID]; !used {
+				reserveGated = append(reserveGated, candidate)
+			}
+			continue
+		}
 		if trackTransientAffinity {
 			affinityCandidates = append(affinityCandidates, candidate)
 		}
@@ -1989,6 +1997,11 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
+		if len(reserveGated) > 0 {
+			errHold := reserve.holdError(reserveGated)
+			m.mu.RUnlock()
+			return nil, nil, errHold
+		}
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -2213,7 +2226,10 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
-	if strings.TrimSpace(model) != "" {
+	// The scheduler does not know the reserve gate: a request it would affect takes the
+	// legacy path, which filters the candidates.
+	reserve := m.reserveCheckFor(opts.Metadata)
+	if strings.TrimSpace(model) != "" || reserve != nil {
 		m.mu.RLock()
 		targetKey := canonicalSchedulingProvider(provider)
 		for _, candidate := range m.auths {
@@ -2226,7 +2242,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 			if _, used := tried[candidate.ID]; used {
 				continue
 			}
-			if m.routeAwareSelectionRequired(candidate, model) {
+			if reserve.blocks(candidate) || m.routeAwareSelectionRequired(candidate, model) {
 				m.mu.RUnlock()
 				return m.pickNextLegacy(ctx, provider, model, opts, tried)
 			}
@@ -2273,6 +2289,8 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
+	reserve := m.reserveCheckFor(opts.Metadata)
+	var reserveGated []*Auth
 
 	providerSet := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
@@ -2329,6 +2347,12 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
+		if reserve.blocks(candidate) {
+			if _, used := tried[candidate.ID]; !used {
+				reserveGated = append(reserveGated, candidate)
+			}
+			continue
+		}
 		if trackTransientAffinity {
 			affinityCandidates = append(affinityCandidates, candidate)
 		}
@@ -2338,6 +2362,11 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		candidates = append(candidates, candidate)
 	}
 	if len(candidates) == 0 {
+		if len(reserveGated) > 0 {
+			errHold := reserve.holdError(reserveGated)
+			m.mu.RUnlock()
+			return nil, nil, "", errHold
+		}
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
@@ -2421,7 +2450,10 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
-	if strings.TrimSpace(model) != "" {
+	// The scheduler does not know the reserve gate: a request it would affect takes the
+	// legacy path, which filters the candidates.
+	reserve := m.reserveCheckFor(opts.Metadata)
+	if strings.TrimSpace(model) != "" || reserve != nil {
 		providerSet := make(map[string]struct{}, len(eligibleProviders))
 		for _, providerKey := range eligibleProviders {
 			providerSet[providerKey] = struct{}{}
@@ -2440,7 +2472,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 			if _, used := tried[candidate.ID]; used {
 				continue
 			}
-			if m.routeAwareSelectionRequired(candidate, model) {
+			if reserve.blocks(candidate) || m.routeAwareSelectionRequired(candidate, model) {
 				m.mu.RUnlock()
 				return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
 			}

@@ -222,6 +222,11 @@ type Manager struct {
 	// It is initialized in NewManager; never Load() before first Store().
 	runtimeConfig atomic.Value
 
+	// reserveGate is routing.reserve-gate compiled from runtimeConfig; nil when disabled.
+	reserveGate atomic.Pointer[reserveGate]
+	// reserveHolds keeps the reserve gate's hysteresis state per account window.
+	reserveHolds reserveHoldBook
+
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
 
