@@ -82,11 +82,11 @@ func nextReserveHold(prev reserveHold, reading reserveReading, ok bool, threshol
 	return reserveHold{}
 }
 
-// latestReserveReading returns the newest reading of window for auth. Every upstream
-// response replaces the credential snapshot (auth.Quota) and the snapshot of the model
-// it served, so the readings of the shared window can sit in either; the snapshot with
-// the newest ObservedAt that carries the window's utilization wins, whatever model it
-// came from.
+// latestReserveReading returns the newest reading of window in the snapshots of auth.
+// Every upstream response replaces the credential snapshot (auth.Quota) and the
+// snapshot of the model it served, so the readings of the shared window can sit in
+// either; the snapshot with the newest ObservedAt that carries the window's utilization
+// wins, whatever model it came from. The hold book keeps a reading the snapshots lost.
 func latestReserveReading(auth *Auth, window string) (reserveReading, bool) {
 	var best reserveReading
 	found := false
@@ -125,28 +125,57 @@ func reserveReadingFromSignals(quota QuotaState, window string) (reserveReading,
 	return reading, found
 }
 
-// reserveHoldBook keeps the hysteresis state per account and window.
-type reserveHoldBook struct {
-	mu    sync.Mutex
-	holds map[string]reserveHold
+// reserveKey names one usage window of one account.
+type reserveKey struct {
+	authID string
+	window string
 }
 
-// update advances the state of one account window and returns it. Transitions are
-// logged so an operator can see when interactive use of an account stops and resumes.
-func (b *reserveHoldBook) update(authID, window string, reading reserveReading, ok bool, gate *reserveGate, now time.Time) reserveHold {
-	key := authID + "|" + window
+// reserveHoldBook keeps, per account and window, the gate's last known reading and its
+// hysteresis state. A response that lacks a window's utilization does not erase the
+// known reading of that window. With a state file set, every change of a reading's
+// utilization or reset, or of a hold, is written to it, and it is read when the gate
+// starts, so a restart keeps known holds. An account with no reading at all is
+// eligible: its first response fills the book.
+type reserveHoldBook struct {
+	mu       sync.Mutex
+	readings map[reserveKey]reserveReading
+	holds    map[reserveKey]reserveHold
+	// path is the state file; empty means the book is kept in memory only.
+	path string
+	// saveMu orders state file writes so the last write carries the newest book.
+	saveMu sync.Mutex
+}
+
+// update merges the live reading of one account window into the book, advances its
+// hold and returns it. The newer of the live and the known reading wins. Transitions
+// are logged so an operator can see when interactive use of an account stops and resumes.
+func (b *reserveHoldBook) update(authID, window string, live reserveReading, liveOK bool, gate *reserveGate, now time.Time) reserveHold {
+	key := reserveKey{authID: authID, window: window}
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	reading, ok := b.readings[key]
+	changed := false
+	if liveOK && (!ok || !live.observedAt.Before(reading.observedAt)) {
+		changed = !ok || live.utilization != reading.utilization || !live.resetAt.Equal(reading.resetAt)
+		if b.readings == nil {
+			b.readings = make(map[reserveKey]reserveReading)
+		}
+		b.readings[key] = live
+		reading, ok = live, true
+	}
 	prev := b.holds[key]
 	next := nextReserveHold(prev, reading, ok, gate.threshold, gate.resumeBelow, now)
 	if next.held {
 		if b.holds == nil {
-			b.holds = make(map[string]reserveHold)
+			b.holds = make(map[reserveKey]reserveHold)
 		}
 		b.holds[key] = next
 	} else {
 		delete(b.holds, key)
 	}
+	changed = changed || next.held != prev.held || !next.until.Equal(prev.until)
+	persist := changed && b.path != ""
+	b.mu.Unlock()
 	if next.held != prev.held {
 		state := "released"
 		if next.held {
@@ -154,7 +183,26 @@ func (b *reserveHoldBook) update(authID, window string, reading reserveReading, 
 		}
 		log.Infof("reserve gate: %s %s window %s for non-exempt callers (utilization %.2f, resets %s)", authID, window, state, reading.utilization, formatReserveReset(reading.resetAt))
 	}
+	if persist {
+		b.save(now)
+	}
 	return next
+}
+
+// recordReserveReadings merges the readings of a response into the book as soon as the
+// response is recorded, so a reading seen only on exempt traffic is kept, and written
+// to the state file, before any request of another caller looks at the account.
+func (m *Manager) recordReserveReadings(auth *Auth) {
+	gate := m.reserveGate.Load()
+	if gate == nil || auth == nil || !isClaudeAuth(auth) {
+		return
+	}
+	now := time.Now()
+	for _, window := range reserveWindows {
+		if reading, ok := latestReserveReading(auth, window); ok {
+			m.reserveHolds.update(auth.ID, window, reading, ok, gate, now)
+		}
+	}
 }
 
 // reserveCheck applies the gate to one request of a caller that is not exempt.

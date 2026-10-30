@@ -11,6 +11,9 @@
 #   (b) hot-reloaded hold: true: non-exempt 429 without Retry-After; exempt 200
 #   (d) while held, a Codex (GPT) route is unaffected for the non-exempt key
 #   (c) hot-reloaded enabled: false: both keys 200
+#   (e) restart with enabled: true: the 0.97 reading kept in the state file holds
+#       before any new upstream response (non-exempt 429 without reaching the
+#       upstream; exempt 200); the state file is mode 600 and holds no key
 # Prints PASS/FAIL per assertion and exits non-zero on any failure.
 #
 # All writes (binary, Go build cache, config, logs, hits) go under
@@ -129,19 +132,23 @@ header() { grep -i "^$2:" "$RUN/$1.headers" | head -1 | cut -d' ' -f2- | tr -d '
 # --- start ---------------------------------------------------------------------
 "$PY" -I "$FAKE" "$UP_PORT" 0.97 "$RUN/upstream.hits" > "$RUN/upstream.log" 2>&1 &
 pids+=($!)
+start_proxy() { # $1 = log file
+    HOME=$RUN/home "$BIN" -config "$RUN/config.yaml" > "$1" 2>&1 &
+    PROXY_PID=$!
+    pids+=($PROXY_PID)
+    for _ in $(seq 1 80); do
+        curl -s -o /dev/null "http://127.0.0.1:${PROXY_PORT}/" && break
+        sleep 0.25
+    done
+    for _ in $(seq 1 80); do
+        grep -q 'file watcher started' "$1" && break
+        sleep 0.25
+    done
+    sleep 1
+    grep -m1 'Version' "$1"
+}
 write_config "    enabled: true"
-HOME=$RUN/home "$BIN" -config "$RUN/config.yaml" > "$RUN/proxy.log" 2>&1 &
-pids+=($!)
-for _ in $(seq 1 80); do
-    curl -s -o /dev/null "http://127.0.0.1:${PROXY_PORT}/" && break
-    sleep 0.25
-done
-for _ in $(seq 1 80); do
-    grep -q 'file watcher started' "$RUN/proxy.log" && break
-    sleep 0.25
-done
-sleep 1
-grep -m1 'Version' "$RUN/proxy.log"
+start_proxy "$RUN/proxy.log"
 
 # --- (a) reading of 0.97 ---------------------------------------------------------
 claude a0 "$AUTO_KEY"   # exempt request records the upstream 0.97 reading
@@ -186,16 +193,39 @@ claude c1 "$USER_KEY"
 claude c2 "$AUTO_KEY"
 [[ $STATUS == 200 ]] && pass "c2 exempt 200 with enabled: false" || fail "c2 exempt: $STATUS $(cat "$RUN/c2.body")"
 
+# --- (e) restart keeps the known hold -------------------------------------------------
+STATE=$RUN/auth/reserve-gate.state
+kill "$PROXY_PID" 2>/dev/null; wait "$PROXY_PID" 2>/dev/null
+write_config "    enabled: true"
+start_proxy "$RUN/proxy-restart.log"
+hits_before=$(grep -c '^/v1/messages' "$RUN/upstream.hits" 2>/dev/null || true)
+claude e1 "$USER_KEY"
+hits_after=$(grep -c '^/v1/messages' "$RUN/upstream.hits" 2>/dev/null || true)
+re=$(header e1 retry-after)
+if [[ $STATUS == 429 ]] && grep -q 'quota reserve hold' "$RUN/e1.body" && [[ -n $re && $hits_after == "$hits_before" ]]; then
+    pass "e1 after restart non-exempt 429 from the state file, Retry-After=$re, upstream not reached"
+else
+    fail "e1 after restart: status=$STATUS retry-after='$re' hits $hits_before->$hits_after body=$(cat "$RUN/e1.body")"
+fi
+claude e2 "$AUTO_KEY"
+[[ $STATUS == 200 ]] && pass "e2 exempt 200 after restart" || fail "e2 exempt: $STATUS $(cat "$RUN/e2.body")"
+mode=$(stat -f '%Lp' "$STATE" 2>/dev/null || stat -c '%a' "$STATE" 2>/dev/null)
+if [[ $mode == 600 ]] && ! grep -q -e "$USER_KEY" -e "$AUTO_KEY" -e 'sk-smoke' "$STATE"; then
+    pass "state file mode 600, no keys"
+else
+    fail "state file mode=$mode or contains a key"
+fi
+
 # --- hygiene ----------------------------------------------------------------------------
-if grep -q -e "$USER_KEY" -e "$AUTO_KEY" "$RUN/proxy.log"; then
+if grep -q -e "$USER_KEY" -e "$AUTO_KEY" "$RUN/proxy.log" "$RUN/proxy-restart.log"; then
     fail "proxy log contains a client key"
 else
     pass "proxy log has no client keys"
 fi
-# Exempt a0, a2, b2 and c1, c2 reach the upstream; the refused a1 and b1 must not.
+# Exempt a0, a2, b2, c1, c2 and e2 reach the upstream; the refused a1, b1 and e1 must not.
 claude_hits=$(grep -c '^/v1/messages' "$RUN/upstream.hits" 2>/dev/null || true)
-[[ $claude_hits == 5 ]] && pass "refused requests never reached the upstream (5 Claude upstream hits)" || fail "Claude upstream hits = $claude_hits, want 5"
-grep 'reserve gate:' "$RUN/proxy.log" | sed 's/^/log: /'
+[[ $claude_hits == 6 ]] && pass "refused requests never reached the upstream (6 Claude upstream hits)" || fail "Claude upstream hits = $claude_hits, want 6"
+grep -h 'reserve gate:' "$RUN/proxy.log" "$RUN/proxy-restart.log" | sed 's/^/log: /'
 printf 'upstream hits: %s\n' "$(sort "$RUN/upstream.hits" | uniq -c | tr -s ' ' | tr '\n' ';')"
 
 cleanup; pids=()

@@ -79,13 +79,20 @@ func reserveGateOn(mutate func(*internalconfig.ReserveGateConfig)) internalconfi
 
 func newReserveRig(t *testing.T, selector Selector, mixed bool, gate internalconfig.ReserveGateConfig) *reserveRig {
 	t.Helper()
+	prefix := fmt.Sprintf("reserve-%d-", reserveRigSeq.Add(1))
+	return newReserveRigWithConfig(t, selector, mixed, &internalconfig.Config{Routing: internalconfig.RoutingConfig{ReserveGate: gate}}, prefix)
+}
+
+// newReserveRigWithConfig builds a rig whose credential IDs start with prefix, so a
+// second rig with the same prefix and config stands in for the proxy after a restart.
+func newReserveRigWithConfig(t *testing.T, selector Selector, mixed bool, cfg *internalconfig.Config, prefix string) *reserveRig {
+	t.Helper()
 	if stopper, ok := selector.(interface{ Stop() }); ok {
 		t.Cleanup(stopper.Stop)
 	}
-	prefix := fmt.Sprintf("reserve-%d-", reserveRigSeq.Add(1))
 	rig := &reserveRig{a: prefix + "a", b: prefix + "b", credit: prefix + "credit", codex: prefix + "codex", mixed: mixed}
 	manager := NewManager(nil, selector, nil)
-	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{ReserveGate: gate}})
+	manager.SetConfig(cfg)
 	manager.RegisterExecutor(&reserveTestExecutor{id: "claude", rig: rig})
 	manager.RegisterExecutor(&reserveTestExecutor{id: "codex", rig: rig})
 	rig.manager = manager

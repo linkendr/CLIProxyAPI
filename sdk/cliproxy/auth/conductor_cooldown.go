@@ -173,6 +173,7 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 	}
 	m.runtimeConfig.Store(cfg)
 	m.reserveGate.Store(compileReserveGate(cfg.Routing.ReserveGate))
+	m.reserveHolds.useStateFile(reserveStatePath(cfg), time.Now())
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
 	if clearedCooldowns && oldCooldownStore != nil {
 		m.mu.Lock()
@@ -1375,6 +1376,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	m.mu.Unlock()
 	releaseMutation()
+	if authSnapshot != nil && !result.SkipQuotaObservation {
+		m.recordReserveReadings(authSnapshot)
+	}
 	if m.scheduler != nil && authSnapshot != nil {
 		credentialScopedResult := result.CredentialScope || scheduleUnauthorizedRefresh
 		var targetModels []string
