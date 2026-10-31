@@ -38,11 +38,59 @@ const earliestResetProbeTTL = 10 * time.Minute
 // upstream response (QuotaState.Signals and ObservedAt). The snapshot is in memory, so it is
 // empty after a restart. The selector keeps only the probe times and the rotation state.
 type EarliestResetSelector struct {
-	mu         sync.Mutex
+	mu sync.Mutex
+	resetProbeState
+	now func() time.Time
+}
+
+// resetProbeState is the per provider:model bookkeeping of the selectors that rank by
+// weekly windows (EarliestResetSelector, PaceSelector): the last pick, for rotation, and
+// when each credential with no known weekly reading was last probed. The owner's mutex
+// guards it.
+type resetProbeState struct {
 	lastPicked map[string]string
 	probedAt   map[string]time.Time
 	maxKeys    int
-	now        func() time.Time
+}
+
+// begin readies the maps for key and bounds their size: the rotation map is cleared when
+// a new key would exceed maxKeys, and probe times older than earliestResetProbeTTL are
+// dropped (all of them if that is not enough).
+func (p *resetProbeState) begin(key string, now time.Time) {
+	if p.lastPicked == nil {
+		p.lastPicked = make(map[string]string)
+	}
+	if p.probedAt == nil {
+		p.probedAt = make(map[string]time.Time)
+	}
+	limit := p.maxKeys
+	if limit <= 0 {
+		limit = 4096
+	}
+	if _, ok := p.lastPicked[key]; !ok && len(p.lastPicked) >= limit {
+		p.lastPicked = make(map[string]string)
+	}
+	if len(p.probedAt) >= limit {
+		for k, at := range p.probedAt {
+			if now.Sub(at) >= earliestResetProbeTTL {
+				delete(p.probedAt, k)
+			}
+		}
+		if len(p.probedAt) >= limit {
+			p.probedAt = make(map[string]time.Time)
+		}
+	}
+}
+
+// probedRecently reports whether auth was probed for key within earliestResetProbeTTL.
+func (p *resetProbeState) probedRecently(key string, auth *Auth, now time.Time) bool {
+	at, ok := p.probedAt[key+"|"+auth.ID]
+	return ok && now.Sub(at) < earliestResetProbeTTL
+}
+
+// markProbed records that auth was probed for key at now.
+func (p *resetProbeState) markProbed(key string, auth *Auth, now time.Time) {
+	p.probedAt[key+"|"+auth.ID] = now
 }
 
 // Pick selects the available auth with the earliest known weekly reset, or an unprobed
@@ -62,38 +110,15 @@ func (s *EarliestResetSelector) Pick(ctx context.Context, provider, model string
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.lastPicked == nil {
-		s.lastPicked = make(map[string]string)
-	}
-	if s.probedAt == nil {
-		s.probedAt = make(map[string]time.Time)
-	}
-	limit := s.maxKeys
-	if limit <= 0 {
-		limit = 4096
-	}
-	if _, ok := s.lastPicked[key]; !ok && len(s.lastPicked) >= limit {
-		s.lastPicked = make(map[string]string)
-	}
-	if len(s.probedAt) >= limit {
-		for k, at := range s.probedAt {
-			if now.Sub(at) >= earliestResetProbeTTL {
-				delete(s.probedAt, k)
-			}
-		}
-		if len(s.probedAt) >= limit {
-			s.probedAt = make(map[string]time.Time)
-		}
-	}
+	s.begin(key, now)
 
 	tied, probe := earliestResetCandidates(available, model, now, func(auth *Auth) bool {
-		at, ok := s.probedAt[key+"|"+auth.ID]
-		return ok && now.Sub(at) < earliestResetProbeTTL
+		return s.probedRecently(key, auth, now)
 	})
 	picked := tied[successorIndex(tied, s.lastPicked[key])]
 	s.lastPicked[key] = picked.ID
 	if probe {
-		s.probedAt[key+"|"+picked.ID] = now
+		s.markProbed(key, picked, now)
 	}
 	return picked, nil
 }

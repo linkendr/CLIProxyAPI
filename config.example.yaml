@@ -160,7 +160,7 @@ access:
 
 # Routing strategy for selecting credentials when multiple match.
 routing:
-  strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first, earliest-reset
+  strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first, earliest-reset, pace
   # earliest-reset picks the available credential whose usage-limit window resets soonest, so quota
   # is spent before it resets and the other credentials stay fresh. Reset times come from the last
   # upstream response (Claude anthropic-ratelimit-unified-*-reset, Codex x-codex-primary/secondary-
@@ -170,6 +170,22 @@ routing:
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
   # Non-positive weights exclude the credential while this strategy is active.
   # For OAuth/file credentials, add a top-level numeric "weight" field to the auth JSON.
+  # pace spreads each Claude credential's weekly quota over the time left in its window: it picks
+  # the credential with the most remaining quota per remaining hour, (1 - utilization) / hours to
+  # reset, from anthropic-ratelimit-unified-7d-* and, for models that report it (Fable), the
+  # model-scoped 7d_oi window (the lower pace of the two counts). A credential whose weekly reset
+  # is within override-hours, and that has quota left, is spent first (earliest reset wins).
+  # A credential with no weekly reading yet is probed once, then ranks behind known ones.
+  # Providers without these headers rotate round-robin. Switch back with strategy: earliest-reset.
+  # Tuning for strategy: pace; ignored by the other strategies. Unknown keys are rejected.
+  pace:
+    # Hours before a weekly reset at which a credential is spent first. 0 turns this off.
+    # Default: 24. Range: 0-168.
+    override-hours: 24
+    # Keep the credential picked last while its pace is at least the best pace / (1 + margin),
+    # so routing does not flap between near-equal credentials. 0 always moves to the best.
+    # Default: 0.10. Range: 0-1.
+    switch-margin: 0.10
   # Enable universal session-sticky routing for all clients.
   # Explicit Claude Code, Codex, OpenCode, and pi session headers are preferred,
   # followed by prompt_cache_key, Responses conversation IDs, legacy body IDs,

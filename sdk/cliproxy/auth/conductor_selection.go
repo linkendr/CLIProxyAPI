@@ -670,19 +670,31 @@ func (m *Manager) availableAuthsForSelector(selector Selector, auths []*Auth, pr
 }
 
 // usesPrevalidatedCandidates reports whether the selector receives manager-validated
-// candidates and an empty model, like the built-in selectors. EarliestResetSelector joins
-// them for candidate handling but not the scheduler fast path, which has no reset ordering.
+// candidates and an empty model, like the built-in selectors. The weekly-window selectors
+// (EarliestResetSelector, PaceSelector) join them for candidate handling but not the
+// scheduler fast path, which has no reset or pace ordering.
 func usesPrevalidatedCandidates(selector Selector) bool {
-	if _, ok := selector.(*EarliestResetSelector); ok {
+	if isWeeklyWindowSelector(selector) {
 		return true
 	}
 	return isBuiltInSelector(selector)
 }
 
+// isWeeklyWindowSelector reports whether the selector ranks by the requested model's
+// weekly quota windows.
+func isWeeklyWindowSelector(selector Selector) bool {
+	switch selector.(type) {
+	case *EarliestResetSelector, *PaceSelector:
+		return true
+	default:
+		return false
+	}
+}
+
 func selectionArgForSelector(selector Selector, routeModel string) string {
-	// EarliestResetSelector reads the requested model's reset data, so it gets the model.
-	// Candidates are still prevalidated via selectorContextForAvailableAuths.
-	if _, ok := selector.(*EarliestResetSelector); ok {
+	// The weekly-window selectors read the requested model's quota data, so they get the
+	// model. Candidates are still prevalidated via selectorContextForAvailableAuths.
+	if isWeeklyWindowSelector(selector) {
 		return routeModel
 	}
 	if usesPrevalidatedCandidates(selector) {
