@@ -56,6 +56,8 @@ type configCommit struct {
 
 type routingRuntimeState struct {
 	strategy                 string
+	paceOverride             time.Duration
+	paceSwitchMargin         float64
 	sessionAffinity          bool
 	sessionAffinityTTL       time.Duration
 	sessionAffinitySubagents bool
@@ -80,6 +82,11 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 		state.strategy = "fill-first"
 	case "earliest-reset", "earliestreset", "er":
 		state.strategy = coreauth.RoutingStrategyEarliestReset
+	case coreauth.RoutingStrategyPace:
+		state.strategy = coreauth.RoutingStrategyPace
+		// Part of the state only under pace, so a pace edit rebuilds the pace selector
+		// and leaves the other strategies' rotation alone.
+		state.paceOverride, state.paceSwitchMargin = cfg.Routing.Pace.Settings()
 	}
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
@@ -108,6 +115,8 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 		selector = &coreauth.FillFirstSelector{}
 	case coreauth.RoutingStrategyEarliestReset:
 		selector = &coreauth.EarliestResetSelector{}
+	case coreauth.RoutingStrategyPace:
+		selector = coreauth.NewPaceSelector(state.paceOverride, state.paceSwitchMargin)
 	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}

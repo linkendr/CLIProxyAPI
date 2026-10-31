@@ -217,6 +217,7 @@ func reserveSelectors() map[string]func() Selector {
 		// Built-in selector: pickNext and pickNextMixed take the scheduler fast path.
 		"round-robin-fast-path": func() Selector { return &RoundRobinSelector{} },
 		"earliest-reset":        func() Selector { return &EarliestResetSelector{} },
+		"pace":                  func() Selector { return NewPaceSelector(24*time.Hour, 0.10) },
 		"affinity": func() Selector {
 			return NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: &EarliestResetSelector{}, TTL: time.Hour})
 		},

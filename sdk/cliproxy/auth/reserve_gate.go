@@ -27,6 +27,9 @@ type reserveGate struct {
 	hold        bool
 	threshold   float64
 	resumeBelow float64
+	// releaseBefore releases a window that would be held once its known reset is at
+	// most this far away; zero turns the release off.
+	releaseBefore time.Duration
 	// exempt holds session.CallerScope hashes of the exempt client keys, the same
 	// value the request carries in CallerScopeMetadataKey. Raw keys are not kept.
 	exempt map[string]struct{}
@@ -37,7 +40,7 @@ func compileReserveGate(cfg internalconfig.ReserveGateConfig) *reserveGate {
 		return nil
 	}
 	threshold, resumeBelow := cfg.Levels()
-	gate := &reserveGate{hold: cfg.Hold, threshold: threshold, resumeBelow: resumeBelow, exempt: make(map[string]struct{}, len(cfg.ExemptAPIKeys))}
+	gate := &reserveGate{hold: cfg.Hold, threshold: threshold, resumeBelow: resumeBelow, releaseBefore: cfg.ReleaseWindow(), exempt: make(map[string]struct{}, len(cfg.ExemptAPIKeys))}
 	for _, key := range cfg.ExemptAPIKeys {
 		if scope := cliproxysession.CallerScope(key); scope != "" {
 			gate.exempt[scope] = struct{}{}
@@ -69,17 +72,28 @@ const reserveWindowSlack = time.Minute
 // rolled over, so it never holds, and a previous hold whose window has reset, or that
 // belongs to an earlier window than the reading, no longer counts. Otherwise a window
 // holds at or above threshold and, once held, stays held until utilization falls below
-// resumeBelow.
-func nextReserveHold(prev reserveHold, reading reserveReading, ok bool, threshold, resumeBelow float64, now time.Time) reserveHold {
+// resumeBelow. A window that would hold is released instead when its known reset is at
+// most releaseBefore away (zero: never): what is left of it expires soon anyway, so
+// keeping it for exempt callers would waste it.
+func nextReserveHold(prev reserveHold, reading reserveReading, ok bool, threshold, resumeBelow float64, releaseBefore time.Duration, now time.Time) reserveHold {
 	if !ok || (!reading.resetAt.IsZero() && !reading.resetAt.After(now)) {
 		return reserveHold{}
 	}
 	sameWindow := prev.until.IsZero() || reading.resetAt.IsZero() || !reading.resetAt.After(prev.until.Add(reserveWindowSlack))
 	wasHeld := prev.held && sameWindow && (prev.until.IsZero() || prev.until.After(now))
 	if reading.utilization >= threshold || (wasHeld && reading.utilization >= resumeBelow) {
+		if releasedBeforeReset(reading, releaseBefore, now) {
+			return reserveHold{}
+		}
 		return reserveHold{held: true, until: reading.resetAt}
 	}
 	return reserveHold{}
+}
+
+// releasedBeforeReset reports whether a reading's known reset is within releaseBefore of
+// now. An unknown reset never releases.
+func releasedBeforeReset(reading reserveReading, releaseBefore time.Duration, now time.Time) bool {
+	return releaseBefore > 0 && !reading.resetAt.IsZero() && reading.resetAt.Sub(now) <= releaseBefore
 }
 
 // latestReserveReading returns the newest reading of window in the snapshots of auth.
@@ -164,7 +178,7 @@ func (b *reserveHoldBook) update(authID, window string, live reserveReading, liv
 		reading, ok = live, true
 	}
 	prev := b.holds[key]
-	next := nextReserveHold(prev, reading, ok, gate.threshold, gate.resumeBelow, now)
+	next := nextReserveHold(prev, reading, ok, gate.threshold, gate.resumeBelow, gate.releaseBefore, now)
 	if next.held {
 		if b.holds == nil {
 			b.holds = make(map[reserveKey]reserveHold)
@@ -180,6 +194,8 @@ func (b *reserveHoldBook) update(authID, window string, live reserveReading, liv
 		state := "released"
 		if next.held {
 			state = "held"
+		} else if ok && releasedBeforeReset(reading, gate.releaseBefore, now) && reading.utilization >= gate.resumeBelow {
+			state = "released before reset (release-before-reset " + gate.releaseBefore.String() + ")"
 		}
 		log.Infof("reserve gate: %s %s window %s for non-exempt callers (utilization %.2f, resets %s)", authID, window, state, reading.utilization, formatReserveReset(reading.resetAt))
 	}

@@ -13,7 +13,10 @@ routing:
     resume-below: 0.90       # stop refusing once usage is below this
     exempt-api-keys: [automation-key]
     state-file: ""           # optional; default <auth-dir>/reserve-gate.state
+    release-before-reset: 0s # optional Go duration; "1h" frees a held window 1h before its reset
 ```
+
+`release-before-reset` (default `0s`, off): a 5h or 7d window that would be held is not held while its known reset is at most this far away, so quota that is about to expire is not kept for nobody. A window with no known reset is never released early. `hold: true` is unaffected. The release is logged (`released before reset`); the state file format is unchanged.
 
 ## State across restarts
 

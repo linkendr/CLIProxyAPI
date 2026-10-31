@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 )
 
 // Default utilization levels of routing.reserve-gate (fractions of a usage window).
@@ -19,9 +20,11 @@ const (
 // usage windows for exempt callers (automations). For every other caller a Claude
 // account is not selected while its latest utilization of either window is held:
 // at or above Threshold, and, once held, until it drops below ResumeBelow or the
-// window resets. Paid credit keys (fallback-when) are never selected for those
-// callers, and Hold pauses every Claude credential for them. Other providers and
-// exempt callers are unaffected. Enabled false means no change at all.
+// window resets. A held window is released early when its reset is within
+// ReleaseBeforeReset, so quota that is about to expire is not kept for nobody. Paid
+// credit keys (fallback-when) are never selected for those callers, and Hold pauses
+// every Claude credential for them. Other providers and exempt callers are
+// unaffected. Enabled false means no change at all.
 type ReserveGateConfig struct {
 	// Enabled turns the gate on. Default false.
 	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
@@ -38,6 +41,10 @@ type ReserveGateConfig struct {
 	// StateFile is where the gate keeps its last readings and holds so a restart does
 	// not forget them. Empty means DefaultReserveGateStateFileName in auth-dir.
 	StateFile string `yaml:"state-file,omitempty" json:"state-file,omitempty"`
+	// ReleaseBeforeReset is a Go duration ("1h"). A 5h or 7d window that would be held
+	// is not held while its known reset is at most this far away. Empty or "0s" turns
+	// the release off. Hold is unaffected.
+	ReleaseBeforeReset string `yaml:"release-before-reset,omitempty" json:"release-before-reset,omitempty"`
 }
 
 // Levels returns the effective threshold and resume level after defaults.
@@ -53,6 +60,31 @@ func (c ReserveGateConfig) Levels() (threshold, resumeBelow float64) {
 	return threshold, resumeBelow
 }
 
+// ReleaseWindow returns ReleaseBeforeReset as a duration; zero when it is empty or
+// invalid (Validate rejects an invalid value).
+func (c ReserveGateConfig) ReleaseWindow() time.Duration {
+	window, errParse := c.parseReleaseBeforeReset()
+	if errParse != nil {
+		return 0
+	}
+	return window
+}
+
+func (c ReserveGateConfig) parseReleaseBeforeReset() (time.Duration, error) {
+	value := strings.TrimSpace(c.ReleaseBeforeReset)
+	if value == "" {
+		return 0, nil
+	}
+	window, errParse := time.ParseDuration(value)
+	if errParse != nil {
+		return 0, errParse
+	}
+	if window < 0 {
+		return 0, fmt.Errorf("negative duration")
+	}
+	return window, nil
+}
+
 // Validate rejects a reserve gate that cannot mean what it says. A typo must fail
 // loudly: a silently ignored gate would let interactive use spend the reserve.
 func (c ReserveGateConfig) Validate() error {
@@ -65,6 +97,9 @@ func (c ReserveGateConfig) Validate() error {
 	}
 	if c.Hold && !c.Enabled {
 		return fmt.Errorf("routing.reserve-gate.hold: requires routing.reserve-gate.enabled: true")
+	}
+	if _, errParse := c.parseReleaseBeforeReset(); errParse != nil {
+		return fmt.Errorf("routing.reserve-gate.release-before-reset: %q is not a non-negative Go duration such as \"1h\": %v", c.ReleaseBeforeReset, errParse)
 	}
 	for index, key := range c.ExemptAPIKeys {
 		if strings.TrimSpace(key) == "" {
