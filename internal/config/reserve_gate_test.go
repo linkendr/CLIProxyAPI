@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseConfigReserveGate(t *testing.T) {
@@ -50,6 +51,9 @@ func TestParseConfigRejectsInvalidReserveGate(t *testing.T) {
 		"empty exempt key":         {"enabled: true\n    exempt-api-keys: ['']", "exempt-api-keys[0]"},
 		"negative resume-below":    {"enabled: true\n    resume-below: -0.1", "resume-below"},
 		"invalid even if disabled": {"threshold: 2", "threshold"},
+		"release not a duration":   {"enabled: true\n    release-before-reset: 1 hour", "release-before-reset"},
+		"release bare number":      {"enabled: true\n    release-before-reset: 60", "release-before-reset"},
+		"negative release":         {"enabled: true\n    release-before-reset: -1h", "release-before-reset"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			raw := "routing:\n  reserve-gate:\n    " + tt.gate + "\n"
@@ -84,5 +88,22 @@ routing:
 	}
 	if cfg.Routing.Strategy != "earliest-reset" {
 		t.Fatalf("strategy = %q", cfg.Routing.Strategy)
+	}
+}
+
+func TestParseConfigReserveGateReleaseBeforeReset(t *testing.T) {
+	for raw, want := range map[string]time.Duration{
+		"":                                    0,
+		"\n    release-before-reset: 0s":      0,
+		"\n    release-before-reset: 1h":      time.Hour,
+		"\n    release-before-reset: \"90m\"": 90 * time.Minute,
+	} {
+		cfg, err := ParseConfigBytes([]byte("routing:\n  reserve-gate:\n    enabled: true" + raw + "\n"))
+		if err != nil {
+			t.Fatalf("%q: %v", raw, err)
+		}
+		if got := cfg.Routing.ReserveGate.ReleaseWindow(); got != want {
+			t.Fatalf("%q: release window = %v, want %v", raw, got, want)
+		}
 	}
 }
