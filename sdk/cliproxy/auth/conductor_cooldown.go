@@ -1078,7 +1078,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							NextRecoverAt: next,
 							BackoffLevel:  backoffLevel,
 						})
-					} else if isInvalidGrantResultError(result.Error) {
+					} else if isInvalidGrantResultError(result.Error) || isCreditBalanceTooLowResultError(result.Error) {
 						if disableCooling {
 							state.NextRetryAfter = time.Time{}
 						} else {
@@ -2355,6 +2355,10 @@ func isTerminalRefreshError(auth *Auth, err error) bool {
 		return isTerminalRefreshError(auth, partErr.OuterRefreshError()) ||
 			isTerminalRefreshError(auth, partErr.SIWCRefreshError())
 	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil && isTerminalRefreshGrantMessage(authErr.Code) {
+		return true
+	}
 	if isUnauthorizedError(err) || isTerminalRefreshGrantMessage(err.Error()) {
 		return true
 	}
@@ -2413,8 +2417,13 @@ func sanitizeRenewalError(auth *Auth, err error) *Error {
 		}
 	}
 	terminal := isTerminalRefreshError(auth, err)
+	code := terminalRefreshErrorCode(raw, statusCode)
+	var existingAuthErr *Error
+	if errors.As(err, &existingAuthErr) && existingAuthErr != nil && isKnownSafeOAuthErrorCode(existingAuthErr.Code) {
+		code = strings.ToLower(strings.TrimSpace(existingAuthErr.Code))
+	}
 	return &Error{
-		Code:       terminalRefreshErrorCode(raw, statusCode),
+		Code:       code,
 		Message:    sanitizeRenewalMessage(raw),
 		HTTPStatus: statusCode,
 		Retryable:  !terminal,
@@ -2597,6 +2606,35 @@ func isInvalidGrantResultError(err *Error) bool {
 	return false
 }
 
+func isCreditBalanceTooLowError(err error) bool {
+	if err == nil {
+		return false
+	}
+	status := statusCodeFromError(err)
+	if clienterror.IsCreditBalanceTooLow(status, err) {
+		return true
+	}
+	var authErr *Error
+	if errors.As(err, &authErr) && authErr != nil && authErr.Message != "" {
+		return clienterror.IsCreditBalanceTooLow(status, errors.New(authErr.Message))
+	}
+	return false
+}
+
+func isCreditBalanceTooLowResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	status := statusCodeFromResult(err)
+	if clienterror.IsCreditBalanceTooLow(status, err) {
+		return true
+	}
+	if err.Message != "" {
+		return clienterror.IsCreditBalanceTooLow(status, errors.New(err.Message))
+	}
+	return false
+}
+
 func isModelSupportResultError(err *Error) bool {
 	if err == nil {
 		return false
@@ -2694,7 +2732,7 @@ func isResponsesCompactRequestFaultError(opts cliproxyexecutor.Options, err erro
 	if !isResponsesCompactRequest(opts) || err == nil {
 		return false
 	}
-	if isCredentialScopedError(err) || isCloudflareChallengeError(err) || isInvalidGrantError(err) {
+	if isCredentialScopedError(err) || isCloudflareChallengeError(err) || isInvalidGrantError(err) || isCreditBalanceTooLowError(err) {
 		return false
 	}
 	status := statusCodeFromError(err)
@@ -2722,10 +2760,10 @@ func isResponsesCompactAvailabilityNeutralError(opts cliproxyexecutor.Options, e
 	if resultErr != nil && resultErr.Code == ErrorCodeForceCooldown {
 		return false
 	}
-	if isCredentialScopedError(err) || isCloudflareChallengeError(err) || isInvalidGrantError(err) {
+	if isCredentialScopedError(err) || isCloudflareChallengeError(err) || isInvalidGrantError(err) || isCreditBalanceTooLowError(err) {
 		return false
 	}
-	if resultErr != nil && (isCloudflareChallengeResultError(resultErr) || isInvalidGrantResultError(resultErr)) {
+	if resultErr != nil && (isCloudflareChallengeResultError(resultErr) || isInvalidGrantResultError(resultErr) || isCreditBalanceTooLowResultError(resultErr)) {
 		return false
 	}
 	status := statusCodeFromError(err)
@@ -2948,6 +2986,9 @@ func isRequestInvalidError(err error) bool {
 	if isInvalidGrantError(err) {
 		return false
 	}
+	if isCreditBalanceTooLowError(err) {
+		return false
+	}
 	if isModelSupportError(err) {
 		return false
 	}
@@ -3014,6 +3055,13 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.NextRetryAfter = next
 	} else if isInvalidGrantResultError(resultErr) {
 		auth.StatusMessage = "invalid_grant"
+		if disableCooling {
+			auth.NextRetryAfter = time.Time{}
+		} else {
+			auth.NextRetryAfter = now.Add(30 * time.Minute)
+		}
+	} else if isCreditBalanceTooLowResultError(resultErr) {
+		auth.StatusMessage = "payment_required"
 		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
 		} else {
