@@ -950,18 +950,18 @@ func TestToClaudeErrorKeepsCooldownResetFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := gjson.GetBytes(body, "error.type").String(); got != "rate_limit_error" {
+	if got := ojson.GetBytes(body, "error.type").String(); got != "rate_limit_error" {
 		t.Fatalf("error.type = %q", got)
 	}
-	if got := gjson.GetBytes(body, "error.reset_seconds"); got.Int() != 5400 {
+	if got := ojson.GetBytes(body, "error.reset_seconds"); got.Int() != 5400 {
 		t.Fatalf("error.reset_seconds = %s, want 5400", got.Raw)
 	}
-	if got := gjson.GetBytes(body, "error.reset_time").String(); got == "" {
+	if got := ojson.GetBytes(body, "error.reset_time").String(); got == "" {
 		t.Fatal("error.reset_time dropped")
 	}
 	plain := h.toClaudeError(&interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, Error: errors.New("slow down")})
 	plainBody, _ := json.Marshal(plain)
-	if gjson.GetBytes(plainBody, "error.reset_seconds").Exists() {
+	if ojson.GetBytes(plainBody, "error.reset_seconds").Exists() {
 		t.Fatal("reset_seconds must be omitted when absent")
 	}
 }
