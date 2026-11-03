@@ -652,16 +652,16 @@ func claudeErrorText(err error) string {
 // claudeErrorResetFromText keeps the proxy cooldown's reset_time and
 // reset_seconds so clients can still tell when to retry.
 func claudeErrorResetFromText(errText string) (string, *int64) {
-	if !gjson.Valid(errText) {
+	if !ojson.Valid(errText) {
 		return "", nil
 	}
-	node := gjson.Get(errText, "error")
+	node := ojson.Get(errText, "error")
 	if !node.IsObject() {
 		return "", nil
 	}
 	resetTime := strings.TrimSpace(node.Get("reset_time").String())
 	seconds := node.Get("reset_seconds")
-	if seconds.Type != gjson.Number {
+	if seconds.Type != ojson.Number {
 		return resetTime, nil
 	}
 	value := seconds.Int()
