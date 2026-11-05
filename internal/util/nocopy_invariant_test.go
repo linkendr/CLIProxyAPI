@@ -114,6 +114,7 @@ var reviewedInPlaceByteWrites = map[string]reviewedInPlaceByteWrite{
 	"internal/runtime/executor/helps/claude_mcp_alias.go":           {1, "copies an HMAC sum into a local fixed-size digest array"},
 	"internal/client/codex/live/tcp_proxy.go":                       {1, "copies header and payload into a freshly allocated frame"},
 	"internal/home/client.go":                                       {1, "zeroes a secret buffer after json.Unmarshal has copied every value out"},
+	"internal/kvstore/bolt_store.go":                                {1, "copies the value into the freshly allocated envelope buffer before it is stored; the caller's slice is only read"},
 	"internal/pluginstore/auth.go":                                  {1, "zeroes a locally built credential buffer after base64 encoding copied it out"},
 }
 
