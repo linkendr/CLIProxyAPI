@@ -2333,14 +2333,16 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 			continue
 		}
 		_, used := tried[candidate.ID]
-		// Pinning restricts selection, not the eligible pool used for accounting.
-		if trackPinnedAccounting && !used {
+		gated := reserve.blocks(candidate)
+		// Pinning restricts selection, not the eligible pool used for accounting;
+		// the reserve gate does shrink that pool, as it does for unpinned requests.
+		if trackPinnedAccounting && !used && !gated {
 			accountingCandidates = append(accountingCandidates, candidate)
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
-		if reserve.blocks(candidate) {
+		if gated {
 			if !used {
 				reserveGated = append(reserveGated, candidate)
 			}
@@ -2804,14 +2806,16 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 			continue
 		}
 		_, used := tried[candidate.ID]
-		// Pinning restricts selection, not the eligible pool used for accounting.
-		if trackPinnedAccounting && !used {
+		gated := reserve.blocks(candidate)
+		// Pinning restricts selection, not the eligible pool used for accounting;
+		// the reserve gate does shrink that pool, as it does for unpinned requests.
+		if trackPinnedAccounting && !used && !gated {
 			accountingCandidates = append(accountingCandidates, candidate)
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
-		if reserve.blocks(candidate) {
+		if gated {
 			if !used {
 				reserveGated = append(reserveGated, candidate)
 			}
