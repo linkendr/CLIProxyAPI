@@ -570,3 +570,36 @@ func TestReserveGateOnSchedulerFastPathWithoutCreditKey(t *testing.T) {
 		})
 	}
 }
+
+// A pinned request accounts against the same eligible pool an unpinned request sees,
+// so a reserve-held peer must not enter the weighted accounting pool.
+func TestReserveGateExcludesHeldPeerFromPinnedAccounting(t *testing.T) {
+	for _, mixed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("mixed=%t", mixed), func(t *testing.T) {
+			weighted := &WeightedRoundRobinSelector{}
+			rig := newReserveRig(t, weighted, mixed, reserveGateOn(nil))
+			rig.observe(t, rig.a, "5h", 0.97, time.Now().Add(2*time.Hour))
+			opts := reserveOpts(reserveTestUserKey, "")
+			opts.Metadata[cliproxyexecutor.PinnedAuthMetadataKey] = rig.b
+			var picked *Auth
+			var err error
+			if mixed {
+				picked, _, _, err = rig.manager.pickNextMixedLegacy(context.Background(), []string{"claude"}, reserveTestClaudeModel, opts, nil)
+			} else {
+				picked, _, err = rig.manager.pickNextLegacy(context.Background(), "claude", reserveTestClaudeModel, opts, nil)
+			}
+			if err != nil || picked == nil || picked.ID != rig.b {
+				t.Fatalf("pinned pick = %v, %v, want %s", picked, err, rig.b)
+			}
+			route := "claude:" + reserveTestClaudeModel
+			if mixed {
+				route = "mixed:" + reserveTestClaudeModel
+			}
+			weightedStateForTest(t, weighted, route, rig.b)
+			held := map[string]int64{rig.a: 1, rig.b: 1}
+			if weighted.states[weightedPoolStateKey(route, held)] != nil {
+				t.Fatalf("pinned accounting pool included reserve-held %s", rig.a)
+			}
+		})
+	}
+}
