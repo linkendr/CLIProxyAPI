@@ -113,6 +113,7 @@ var reviewedInPlaceByteWrites = map[string]reviewedInPlaceByteWrite{
 	"internal/runtime/executor/xai_executor_request.go":             {5, "copies streamed tokens into private scanner/quote scratch buffers; no byte of any payload is rewritten"},
 	"internal/runtime/executor/helps/claude_credential_identity.go": {1, "copies key bytes into a local stack-allocated quote array for json.Unmarshal"},
 	"internal/runtime/executor/helps/claude_mcp_alias.go":           {1, "copies an HMAC sum into a local fixed-size digest array"},
+	"sdk/cliproxy/auth/selector_weighted.go":                        {2, "shifts []weightedPoolMember pool entries in private selector state to insert or remove a member; no byte of any payload is rewritten"},
 	"internal/client/codex/live/tcp_proxy.go":                       {1, "copies header and payload into a freshly allocated frame"},
 	"internal/home/client.go":                                       {1, "zeroes a secret buffer after json.Unmarshal has copied every value out"},
 	"internal/pluginstore/auth.go":                                  {1, "zeroes a locally built credential buffer after base64 encoding copied it out"},

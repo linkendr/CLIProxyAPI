@@ -310,7 +310,7 @@ func SafeResponseHeaders(err error) http.Header {
 	}
 	var modelCooldown *modelCooldownError
 	if errors.As(err, &modelCooldown) && modelCooldown != nil {
-		return modelCooldown.Headers()
+		return modelCooldown.SafeResponseHeaders()
 	}
 	var reserveHold *reserveHoldError
 	if errors.As(err, &reserveHold) && reserveHold != nil {
