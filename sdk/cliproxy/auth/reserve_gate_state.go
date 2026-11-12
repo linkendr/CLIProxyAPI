@@ -18,8 +18,10 @@ import (
 // reserveStateVersion is the version of the reserve gate state file.
 const reserveStateVersion = 1
 
-// reserveStateFile is the reserve gate state file: per account ID and window ("5h",
-// "7d"), the last known reading and the hold. It holds no credential data.
+// reserveStateFile is the reserve gate state file: per account ID and window ("7d"), the
+// last known reading and the hold. It holds no credential data. Files written by older
+// builds may carry a "5h" window or fields this build does not know; the loader skips
+// the window and JSON decoding ignores the fields.
 type reserveStateFile struct {
 	Version   int                                      `json:"version"`
 	UpdatedAt time.Time                                `json:"updated_at"`
@@ -60,7 +62,8 @@ func reserveStatePath(cfg *internalconfig.Config) string {
 }
 
 // useStateFile points the book at path. A new path is read into the book: entries the
-// book already knows stay as they are, and entries whose window has reset are dropped.
+// book already knows stay as they are, entries whose window has reset are dropped, and
+// windows the gate no longer reads (5h) are skipped.
 // A missing or unreadable file leaves the book as it is, with a log line.
 func (b *reserveHoldBook) useStateFile(path string, now time.Time) {
 	b.mu.Lock()

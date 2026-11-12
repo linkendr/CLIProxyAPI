@@ -45,12 +45,12 @@ func (d *reserveHomeDispatcher) RPopAuthWithConstraints(_ context.Context, model
 func (d *reserveHomeDispatcher) AbortAmbiguousDispatch() {}
 
 // reserveHomeAuth is a Claude OAuth account as Home sends it, with Home's quota snapshot.
-func reserveHomeAuth(id string, utilization5h float64, reset time.Time) Auth {
+func reserveHomeAuth(id string, utilization7d float64, reset time.Time) Auth {
 	auth := Auth{ID: id, Provider: "claude", Status: StatusActive, Attributes: map[string]string{"auth_kind": "oauth"}}
-	if utilization5h >= 0 {
+	if utilization7d >= 0 {
 		auth.Quota = QuotaState{ObservedAt: time.Now(), Signals: map[string]string{
-			"anthropic-ratelimit-unified-5h-utilization": strconv.FormatFloat(utilization5h, 'f', 2, 64),
-			"anthropic-ratelimit-unified-5h-reset":       strconv.FormatInt(reset.Unix(), 10),
+			"anthropic-ratelimit-unified-7d-utilization": strconv.FormatFloat(utilization7d, 'f', 2, 64),
+			"anthropic-ratelimit-unified-7d-reset":       strconv.FormatInt(reset.Unix(), 10),
 		}}
 	}
 	return auth
@@ -67,8 +67,10 @@ func newReserveHomeManager(t *testing.T, gate internalconfig.ReserveGateConfig, 
 	return manager, rig
 }
 
-// Under Home the control center picks the credential, so the gate applies to its pick:
-// a non-exempt caller is moved off a held account, the exempt caller is not.
+// Under Home the control center owns the credential list, so the gate applies to its
+// pick: a non-exempt caller is moved off a held account to the next one Home offers,
+// which keeps the caller served while Home has a login with room; the exempt caller is
+// not moved.
 func TestReserveGateHomeDispatchSkipsHeldAccount(t *testing.T) {
 	reset := time.Now().Add(time.Hour)
 	dispatcher := &reserveHomeDispatcher{byModel: map[string][]Auth{

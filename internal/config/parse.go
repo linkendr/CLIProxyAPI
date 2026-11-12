@@ -19,6 +19,9 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 	if errValidate := validateCredentialWeightYAML(data); errValidate != nil {
 		return nil, errValidate
 	}
+	if errValidate := validateReserveGateYAML(data); errValidate != nil {
+		return nil, errValidate
+	}
 
 	var cfg Config
 	// Keep defaults aligned with LoadConfigOptional.

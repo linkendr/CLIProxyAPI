@@ -193,3 +193,13 @@ func quotaSignalsShowSharedWindowRejected(signals map[string]string) bool {
 	}
 	return false
 }
+
+// onlyCreditCandidates reports whether every candidate is a Claude credit key.
+func onlyCreditCandidates(candidates []*Auth) bool {
+	for _, candidate := range candidates {
+		if !isClaudeAuth(candidate) || authFallbackWhen(candidate) == "" {
+			return false
+		}
+	}
+	return len(candidates) > 0
+}

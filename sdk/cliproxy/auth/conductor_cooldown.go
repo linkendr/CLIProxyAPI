@@ -173,7 +173,11 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 		m.homeSessionAliases.clear()
 	}
 	m.runtimeConfig.Store(cfg)
-	m.reserveGate.Store(compileReserveGate(cfg.Routing.ReserveGate))
+	compiledReserveGate := compileReserveGate(cfg.Routing.ReserveGate)
+	m.reserveGate.Store(compiledReserveGate)
+	if compiledReserveGate == nil {
+		m.reserveTrigger.clear()
+	}
 	m.reserveHolds.useStateFile(reserveStatePath(cfg), time.Now())
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
 	if clearedCooldowns && oldCooldownStore != nil {

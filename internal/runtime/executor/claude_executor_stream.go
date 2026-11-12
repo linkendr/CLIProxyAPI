@@ -249,6 +249,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	extraBetas, bodyForUpstream = extractAndRemoveBetas(bodyForUpstream)
 	bodyForUpstream = stripPromptCacheOptions(bodyForUpstream)
+	// The reserve gate's wrap-up note goes in last, after every rewrite and before the
+	// body is signed, so nothing moves it off the end of the last user message.
+	bodyForUpstream = applyClaudeReserveWindDownNote(auth, opts.Metadata, bodyForUpstream)
 	if cchSigning {
 		bodyForUpstream, err = signAnthropicMessagesBody(bodyForUpstream)
 		if err != nil {

@@ -1952,7 +1952,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
-	reserve := m.reserveCheckFor(opts.Metadata)
+	reserve := m.reserveCheckFor(opts)
 	var reserveGated []*Auth
 	pluginScheduler, schedulerAcross := m.snapshotPluginScheduler()
 
@@ -2019,6 +2019,13 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	now := time.Now()
 	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, provider, model, now, schedulerAcross)
+	if errAvailable != nil && len(reserveGated) > 0 && onlyCreditCandidates(candidates) {
+		// The reserve gate removed every Max login and no credit key may serve yet: the
+		// caller gets the reserve hold, not the credit keys' unavailability.
+		errHold := reserve.holdError(reserveGated)
+		m.mu.RUnlock()
+		return nil, nil, errHold
+	}
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errAvailable)
@@ -2240,7 +2247,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
 	// The scheduler does not know the reserve gate: a request it would affect takes the
 	// legacy path, which filters the candidates.
-	reserve := m.reserveCheckFor(opts.Metadata)
+	reserve := m.reserveCheckFor(opts)
 	if strings.TrimSpace(model) != "" || reserve != nil {
 		m.mu.RLock()
 		targetKey := canonicalSchedulingProvider(provider)
@@ -2301,7 +2308,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
-	reserve := m.reserveCheckFor(opts.Metadata)
+	reserve := m.reserveCheckFor(opts)
 	var reserveGated []*Auth
 
 	providerSet := make(map[string]struct{}, len(providers))
@@ -2384,6 +2391,11 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	}
 	now := time.Now()
 	available, selectorAuths, errAvailable := m.availableAuthsForSelector(selector, candidates, "mixed", model, now, schedulerAcross)
+	if errAvailable != nil && len(reserveGated) > 0 && onlyCreditCandidates(candidates) {
+		errHold := reserve.holdError(reserveGated)
+		m.mu.RUnlock()
+		return nil, nil, "", errHold
+	}
 	if errAvailable != nil {
 		m.mu.RUnlock()
 		m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errAvailable)
@@ -2464,7 +2476,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
 	// The scheduler does not know the reserve gate: a request it would affect takes the
 	// legacy path, which filters the candidates.
-	reserve := m.reserveCheckFor(opts.Metadata)
+	reserve := m.reserveCheckFor(opts)
 	if strings.TrimSpace(model) != "" || reserve != nil {
 		providerSet := make(map[string]struct{}, len(eligibleProviders))
 		for _, providerKey := range eligibleProviders {

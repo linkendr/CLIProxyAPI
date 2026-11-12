@@ -178,7 +178,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		return cfg, nil
 	}
 
-	if errValidate := validateCredentialWeightYAML(data); errValidate != nil {
+	errValidate := validateCredentialWeightYAML(data)
+	if errValidate == nil {
+		errValidate = validateReserveGateYAML(data)
+	}
+	if errValidate != nil {
 		if optional {
 			cfgOptional := &Config{CredentialInFlight: DefaultCredentialInFlightConfig()}
 			cfgOptional.NormalizePluginsConfig()

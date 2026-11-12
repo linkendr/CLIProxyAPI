@@ -1,110 +1,113 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
-// Default utilization levels of routing.reserve-gate (fractions of a usage window).
+// Default utilization level of routing.reserve-gate (fraction of a usage window).
 const (
-	DefaultReserveGateThreshold   = 0.95
-	DefaultReserveGateResumeBelow = 0.90
+	DefaultReserveGateThreshold = 0.95
 	// DefaultReserveGateStateFileName is the state file kept in auth-dir. It is not a
 	// .json file, so the auth watcher and loader never read it as a credential.
 	DefaultReserveGateStateFileName = "reserve-gate.state"
+	// DefaultReserveGateWindDownMinutes is how long, after every Max login first
+	// became held, a running task of a caller that is not exempt may still finish.
+	DefaultReserveGateWindDownMinutes = 15
 )
 
-// ReserveGateConfig keeps the last part of every Claude account's 5-hour and 7-day
-// usage windows for exempt callers (automations). For every other caller a Claude
-// account is not selected while its latest utilization of either window is held:
-// at or above Threshold, and, once held, until it drops below ResumeBelow or the
-// window resets. A held window is released early when its reset is within
-// ReleaseBeforeReset, so quota that is about to expire is not kept for nobody. Paid
-// credit keys (fallback-when) are never selected for those callers, and Hold pauses
-// every Claude credential for them. Other providers and exempt callers are
-// unaffected. Enabled false means no change at all.
+// ReserveGateConfig keeps the last part of the Claude Max logins' 7-day usage for
+// exempt callers (automations). A Max login is held while its latest 7d utilization is
+// at or above Threshold, until that window resets. The reserve is shared: callers that
+// are not exempt are kept off held logins only while every Max login is held (or at a
+// real upstream limit); while one still has room, they may use any of them. Paid credit
+// keys (fallback-when) serve those callers only under their own fallback-when rule, and
+// Hold pauses every Claude credential for them. While every Max login is held, a running
+// task (the request answers a tool call) of such a caller is still served for
+// WindDownMinutes, with a note asking the model to wrap up; new prompts are refused.
+// Other providers and exempt callers are unaffected. Enabled false means no change at all.
 type ReserveGateConfig struct {
 	// Enabled turns the gate on. Default false.
 	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	// Hold pauses every Claude credential for callers that are not exempt.
 	Hold bool `yaml:"hold,omitempty" json:"hold,omitempty"`
-	// Threshold is the utilization (0-1) at or above which an account window is held.
+	// Threshold is the 7d utilization (0-1) at or above which a Max login is held.
 	// Zero means DefaultReserveGateThreshold.
 	Threshold float64 `yaml:"threshold,omitempty" json:"threshold,omitempty"`
-	// ResumeBelow is the utilization (0-1) below which a held window is released.
-	// Zero means DefaultReserveGateResumeBelow, or Threshold when that is lower.
-	ResumeBelow float64 `yaml:"resume-below,omitempty" json:"resume-below,omitempty"`
 	// ExemptAPIKeys lists the client keys (access api-keys) the gate never applies to.
 	ExemptAPIKeys []string `yaml:"exempt-api-keys,omitempty" json:"exempt-api-keys,omitempty"`
 	// StateFile is where the gate keeps its last readings and holds so a restart does
 	// not forget them. Empty means DefaultReserveGateStateFileName in auth-dir.
 	StateFile string `yaml:"state-file,omitempty" json:"state-file,omitempty"`
-	// ReleaseBeforeReset is a Go duration ("1h"). A 5h or 7d window that would be held
-	// is not held while its known reset is at most this far away. Empty or "0s" turns
-	// the release off. Hold is unaffected.
-	ReleaseBeforeReset string `yaml:"release-before-reset,omitempty" json:"release-before-reset,omitempty"`
+	// WindDownMinutes is how long after every Max login first became held a running
+	// task of a caller that is not exempt is still served. Unset means
+	// DefaultReserveGateWindDownMinutes; 0 refuses running tasks at once.
+	WindDownMinutes *int `yaml:"wind-down-minutes,omitempty" json:"wind-down-minutes,omitempty"`
 }
 
-// Levels returns the effective threshold and resume level after defaults.
-func (c ReserveGateConfig) Levels() (threshold, resumeBelow float64) {
-	threshold = c.Threshold
-	if threshold == 0 {
-		threshold = DefaultReserveGateThreshold
+// EffectiveWindDown returns WindDownMinutes after its default.
+func (c ReserveGateConfig) EffectiveWindDown() time.Duration {
+	if c.WindDownMinutes == nil {
+		return DefaultReserveGateWindDownMinutes * time.Minute
 	}
-	resumeBelow = c.ResumeBelow
-	if resumeBelow == 0 {
-		resumeBelow = math.Min(DefaultReserveGateResumeBelow, threshold)
-	}
-	return threshold, resumeBelow
+	return time.Duration(*c.WindDownMinutes) * time.Minute
 }
 
-// ReleaseWindow returns ReleaseBeforeReset as a duration; zero when it is empty or
-// invalid (Validate rejects an invalid value).
-func (c ReserveGateConfig) ReleaseWindow() time.Duration {
-	window, errParse := c.parseReleaseBeforeReset()
-	if errParse != nil {
-		return 0
+// EffectiveThreshold returns Threshold after its default.
+func (c ReserveGateConfig) EffectiveThreshold() float64 {
+	if c.Threshold == 0 {
+		return DefaultReserveGateThreshold
 	}
-	return window
-}
-
-func (c ReserveGateConfig) parseReleaseBeforeReset() (time.Duration, error) {
-	value := strings.TrimSpace(c.ReleaseBeforeReset)
-	if value == "" {
-		return 0, nil
-	}
-	window, errParse := time.ParseDuration(value)
-	if errParse != nil {
-		return 0, errParse
-	}
-	if window < 0 {
-		return 0, fmt.Errorf("negative duration")
-	}
-	return window, nil
+	return c.Threshold
 }
 
 // Validate rejects a reserve gate that cannot mean what it says. A typo must fail
 // loudly: a silently ignored gate would let interactive use spend the reserve.
 func (c ReserveGateConfig) Validate() error {
-	threshold, resumeBelow := c.Levels()
+	threshold := c.EffectiveThreshold()
 	if math.IsNaN(threshold) || threshold <= 0 || threshold > 1 {
 		return fmt.Errorf("routing.reserve-gate.threshold: %v is outside (0, 1]", c.Threshold)
 	}
-	if math.IsNaN(resumeBelow) || resumeBelow <= 0 || resumeBelow > threshold {
-		return fmt.Errorf("routing.reserve-gate.resume-below: %v must be above 0 and at most threshold %v", c.ResumeBelow, threshold)
+	if c.WindDownMinutes != nil && (*c.WindDownMinutes < 0 || *c.WindDownMinutes > 24*60) {
+		return fmt.Errorf("routing.reserve-gate.wind-down-minutes: %d is outside [0, 1440]", *c.WindDownMinutes)
 	}
 	if c.Hold && !c.Enabled {
 		return fmt.Errorf("routing.reserve-gate.hold: requires routing.reserve-gate.enabled: true")
-	}
-	if _, errParse := c.parseReleaseBeforeReset(); errParse != nil {
-		return fmt.Errorf("routing.reserve-gate.release-before-reset: %q is not a non-negative Go duration such as \"1h\": %v", c.ReleaseBeforeReset, errParse)
 	}
 	for index, key := range c.ExemptAPIKeys {
 		if strings.TrimSpace(key) == "" {
 			return fmt.Errorf("routing.reserve-gate.exempt-api-keys[%d]: empty key", index)
 		}
+	}
+	return nil
+}
+
+// validateReserveGateYAML rejects a key under routing.reserve-gate that the gate does not
+// know. The config loader ignores unknown keys, but a misspelt or removed reserve key
+// would silently change who may spend the reserve, so it must fail loudly.
+func validateReserveGateYAML(data []byte) error {
+	var document yaml.Node
+	if errUnmarshal := yaml.Unmarshal(data, &document); errUnmarshal != nil || len(document.Content) == 0 {
+		return nil
+	}
+	node := yamlPath(expandConfigAliases(document.Content[0]), "routing.reserve-gate")
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	encoded, errMarshal := yaml.Marshal(node)
+	if errMarshal != nil {
+		return nil
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(encoded))
+	decoder.KnownFields(true)
+	var gate ReserveGateConfig
+	if errDecode := decoder.Decode(&gate); errDecode != nil {
+		return fmt.Errorf("routing.reserve-gate: %w", errDecode)
 	}
 	return nil
 }

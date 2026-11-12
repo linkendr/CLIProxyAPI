@@ -55,8 +55,8 @@ func TestReserveGateHoldReachesClientAs429(t *testing.T) {
 		ID: "reserve-gate-response-oauth", Provider: "claude", Status: coreauth.StatusActive,
 		Attributes: map[string]string{"auth_kind": "oauth"},
 		Quota: coreauth.QuotaState{ObservedAt: time.Now(), Signals: map[string]string{
-			"Anthropic-Ratelimit-Unified-5h-Utilization": "0.99",
-			"Anthropic-Ratelimit-Unified-5h-Reset":       strconv.FormatInt(reset.Unix(), 10),
+			"Anthropic-Ratelimit-Unified-7d-Utilization": "0.99",
+			"Anthropic-Ratelimit-Unified-7d-Reset":       strconv.FormatInt(reset.Unix(), 10),
 		}},
 	}
 	if _, err := manager.Register(coreauth.WithSkipPersist(context.Background()), auth); err != nil {
