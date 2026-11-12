@@ -337,7 +337,7 @@ func TestReserveGateDisabledLeavesSelectionUnchanged(t *testing.T) {
 // other login stays usable too.
 func TestReserveGateSharedOneHeldLoginStillServes(t *testing.T) {
 	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
-		rig.observe(t, rig.a, "7d", 0.97, time.Now().Add(2*time.Hour))
+		rig.observe(t, rig.a, "7d", 0.97, time.Now().Add(7*time.Hour))
 		rig.observe(t, rig.b, "7d", 0.30, time.Now().Add(6*24*time.Hour))
 		check := rig.manager.reserveCheckFor(reserveOpts(reserveTestUserKey, ""))
 		rig.manager.mu.RLock()
@@ -365,7 +365,8 @@ func TestReserveGateSharedOneHeldLoginStillServes(t *testing.T) {
 }
 
 // Case 2: every Max login held: the ordinary caller is blocked from both and gets the
-// reserve 429 with Retry-After at the earliest reset; the exempt caller is served.
+// reserve 429 with Retry-After at the earliest release (b, 99% with 90 minutes left, is
+// released in its final hour); the exempt caller is served.
 func TestReserveGateAllHeldReturns429WithRetryAfter(t *testing.T) {
 	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
 		soon := time.Now().Add(90 * time.Minute).Truncate(time.Second)
@@ -376,7 +377,7 @@ func TestReserveGateAllHeldReturns429WithRetryAfter(t *testing.T) {
 		if !isRequestStopError(err) {
 			t.Fatal("reserve hold error must stop the request, not retry it")
 		}
-		requireRetryAfterNear(t, err, soon)
+		requireRetryAfterNear(t, err, soon.Add(-time.Hour))
 		if hold.resetAt.IsZero() {
 			t.Fatal("hold error has no reset time")
 		}
@@ -425,7 +426,7 @@ func TestReserveGateLimitedLoginWithoutReadingHasNoRoom(t *testing.T) {
 func TestReserveGateCreditKeyServesNonExemptCallerOnlyAtRealLimit(t *testing.T) {
 	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
 		rig.observe(t, rig.a, "7d", 0.97, time.Now().Add(48*time.Hour))
-		rig.observe(t, rig.b, "7d", 0.96, time.Now().Add(time.Hour))
+		rig.observe(t, rig.b, "7d", 0.96, time.Now().Add(25*time.Hour))
 		_, err := rig.pick(reserveTestUserKey, "s0", reserveTestClaudeModel)
 		requireReserveHold(t, err)
 		rig.limitAt(t, rig.a, time.Now().Add(48*time.Hour))
@@ -454,12 +455,13 @@ func TestReserveGateCreditKeyServesWhenBothCoolWithoutReadings(t *testing.T) {
 // held login is blocked for the ordinary caller.
 func TestReserveGateDisabledLoginDoesNotCountAsRoom(t *testing.T) {
 	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
-		reset := time.Now().Add(5 * time.Hour).Truncate(time.Second)
+		reset := time.Now().Add(29 * time.Hour).Truncate(time.Second)
 		rig.observe(t, rig.a, "7d", 0.97, reset)
 		rig.disable(t, rig.b)
 		_, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
 		requireReserveHold(t, err)
-		requireRetryAfterNear(t, err, reset)
+		// At 97% a is released when its limit rises to 99%, 6 h before its reset.
+		requireRetryAfterNear(t, err, reset.Add(-6*time.Hour))
 		if seen := rig.picked(t, reserveTestExemptKey, 3); seen[rig.a] != 3 {
 			t.Fatalf("exempt picks = %v, want %s", seen, rig.a)
 		}
@@ -494,7 +496,7 @@ func TestReserveGateHoldsAtThresholdWithoutHysteresis(t *testing.T) {
 func TestReserveGatePassedResetReleases(t *testing.T) {
 	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
 		rig.observe(t, rig.b, "7d", 0.97, time.Now().Add(48*time.Hour))
-		rig.observe(t, rig.a, "7d", 0.97, time.Now().Add(time.Hour))
+		rig.observe(t, rig.a, "7d", 0.97, time.Now().Add(25*time.Hour))
 		if _, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel); err == nil {
 			t.Fatal("both at 0.97 must hold")
 		}
@@ -590,14 +592,14 @@ func TestReserveGateSessionBoundToHeldAccount(t *testing.T) {
 		if first.ID == rig.a {
 			other = rig.b
 		}
-		rig.observe(t, first.ID, "7d", 0.97, time.Now().Add(time.Hour))
+		rig.observe(t, first.ID, "7d", 0.97, time.Now().Add(25*time.Hour))
 		for i := 0; i < 3; i++ {
 			auth, errPick := rig.pick(reserveTestUserKey, "bound-session", reserveTestClaudeModel)
 			if errPick != nil || (auth.ID != first.ID && auth.ID != other) {
 				t.Fatalf("pick #%d for a session bound to held %s = %v, %v; want a Max login", i, first.ID, auth, errPick)
 			}
 		}
-		rig.observe(t, other, "7d", 0.97, time.Now().Add(2*time.Hour))
+		rig.observe(t, other, "7d", 0.97, time.Now().Add(26*time.Hour))
 		_, errPick := rig.pick(reserveTestUserKey, "bound-session", reserveTestClaudeModel)
 		requireReserveHold(t, errPick)
 	})
@@ -610,7 +612,7 @@ func TestReserveGateSessionBoundToHeldAccount(t *testing.T) {
 func TestReserveGateUsesFreshestReadingAcrossModelSnapshots(t *testing.T) {
 	rig := newReserveRig(t, &EarliestResetSelector{}, true, reserveGateOn(nil))
 	now := time.Now()
-	reset := now.Add(2 * time.Hour)
+	reset := now.Add(26 * time.Hour)
 	rig.observe(t, rig.b, "7d", 0.97, now.Add(48*time.Hour))
 	rig.observeAt(t, rig.a, "", "7d", 0.50, reset, now.Add(-10*time.Minute))
 	rig.observeAt(t, rig.a, "other-model", "7d", 0.97, reset, now.Add(-time.Minute))
@@ -630,7 +632,7 @@ func TestReserveGateAppliesToExecuteStreamAndCount(t *testing.T) {
 	for name, selector := range reserveSelectors() {
 		t.Run(name, func(t *testing.T) {
 			rig := newReserveRig(t, selector(), true, reserveGateOn(nil))
-			rig.observe(t, rig.a, "7d", 0.99, time.Now().Add(time.Hour))
+			rig.observe(t, rig.a, "7d", 0.99, time.Now().Add(25*time.Hour))
 			rig.observe(t, rig.b, "7d", 0.99, time.Now().Add(24*time.Hour))
 			ctx := context.Background()
 			req := cliproxyexecutor.Request{Model: reserveTestClaudeModel}
@@ -709,7 +711,7 @@ func TestReserveGateOnSchedulerFastPathWithoutCreditKey(t *testing.T) {
 			if seen := rig.picked(t, reserveTestUserKey, 4); seen[rig.a]+seen[rig.b] != 4 || seen[rig.a] == 0 || seen[rig.b] == 0 {
 				t.Fatalf("picks with nothing held = %v, want both accounts", seen)
 			}
-			rig.observe(t, rig.a, "7d", 0.98, time.Now().Add(time.Hour))
+			rig.observe(t, rig.a, "7d", 0.98, time.Now().Add(25*time.Hour))
 			if seen := rig.picked(t, reserveTestUserKey, 6); seen[rig.a] == 0 || seen[rig.b] == 0 {
 				t.Fatalf("non-exempt picks with only %s held = %v, want both in rotation", rig.a, seen)
 			}

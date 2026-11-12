@@ -19,11 +19,21 @@ const (
 	// DefaultReserveGateWindDownMinutes is how long, after every Max login first
 	// became held, a running task of a caller that is not exempt may still finish.
 	DefaultReserveGateWindDownMinutes = 15
+	// DefaultReserveGateNearResetHours is how long before a Max login's weekly reset its
+	// limit rises to DefaultReserveGateNearResetThreshold.
+	DefaultReserveGateNearResetHours = 6
+	// DefaultReserveGateNearResetThreshold is the limit of a Max login near its reset.
+	DefaultReserveGateNearResetThreshold = 0.99
+	// DefaultReserveGateFinalReleaseHours is how long before a Max login's weekly reset
+	// its limit is 1: nothing is kept, every caller may use what is left.
+	DefaultReserveGateFinalReleaseHours = 1
 )
 
 // ReserveGateConfig keeps the last part of the Claude Max logins' 7-day usage for
 // exempt callers (automations). A Max login is held while its latest 7d utilization is
-// at or above Threshold, until that window resets. The reserve is shared: callers that
+// at or above its limit, which steps up as the login's own weekly reset comes near:
+// Threshold while more than NearResetHours remain, NearResetThreshold from then on, and
+// 1 in the final FinalReleaseHours. A login with no known reset keeps Threshold. The reserve is shared: callers that
 // are not exempt are kept off held logins only while every Max login is held (or at a
 // real upstream limit); while one still has room, they may use any of them. Paid credit
 // keys (fallback-when) serve those callers only under their own fallback-when rule, and
@@ -48,6 +58,39 @@ type ReserveGateConfig struct {
 	// task of a caller that is not exempt is still served. Unset means
 	// DefaultReserveGateWindDownMinutes; 0 refuses running tasks at once.
 	WindDownMinutes *int `yaml:"wind-down-minutes,omitempty" json:"wind-down-minutes,omitempty"`
+	// NearResetHours is how long before a login's weekly reset its limit rises to
+	// NearResetThreshold. Unset means DefaultReserveGateNearResetHours; 0 turns it off.
+	NearResetHours *int `yaml:"near-reset-hours,omitempty" json:"near-reset-hours,omitempty"`
+	// NearResetThreshold is the limit (0-1) near the reset; a Threshold above it wins.
+	// Zero means DefaultReserveGateNearResetThreshold.
+	NearResetThreshold float64 `yaml:"near-reset-threshold,omitempty" json:"near-reset-threshold,omitempty"`
+	// FinalReleaseHours is how long before a login's weekly reset its limit is 1. Unset
+	// means DefaultReserveGateFinalReleaseHours; 0 turns it off.
+	FinalReleaseHours *int `yaml:"final-release-hours,omitempty" json:"final-release-hours,omitempty"`
+}
+
+// EffectiveNearReset returns NearResetHours after its default.
+func (c ReserveGateConfig) EffectiveNearReset() time.Duration {
+	if c.NearResetHours == nil {
+		return DefaultReserveGateNearResetHours * time.Hour
+	}
+	return time.Duration(*c.NearResetHours) * time.Hour
+}
+
+// EffectiveNearResetThreshold returns NearResetThreshold after its default.
+func (c ReserveGateConfig) EffectiveNearResetThreshold() float64 {
+	if c.NearResetThreshold == 0 {
+		return DefaultReserveGateNearResetThreshold
+	}
+	return c.NearResetThreshold
+}
+
+// EffectiveFinalRelease returns FinalReleaseHours after its default.
+func (c ReserveGateConfig) EffectiveFinalRelease() time.Duration {
+	if c.FinalReleaseHours == nil {
+		return DefaultReserveGateFinalReleaseHours * time.Hour
+	}
+	return time.Duration(*c.FinalReleaseHours) * time.Hour
 }
 
 // EffectiveWindDown returns WindDownMinutes after its default.
@@ -75,6 +118,19 @@ func (c ReserveGateConfig) Validate() error {
 	}
 	if c.WindDownMinutes != nil && (*c.WindDownMinutes < 0 || *c.WindDownMinutes > 24*60) {
 		return fmt.Errorf("routing.reserve-gate.wind-down-minutes: %d is outside [0, 1440]", *c.WindDownMinutes)
+	}
+	if c.NearResetHours != nil && (*c.NearResetHours < 0 || *c.NearResetHours > 7*24) {
+		return fmt.Errorf("routing.reserve-gate.near-reset-hours: %d is outside [0, 168]", *c.NearResetHours)
+	}
+	nearThreshold := c.EffectiveNearResetThreshold()
+	if math.IsNaN(nearThreshold) || nearThreshold <= 0 || nearThreshold > 1 {
+		return fmt.Errorf("routing.reserve-gate.near-reset-threshold: %v is outside (0, 1]", c.NearResetThreshold)
+	}
+	if c.FinalReleaseHours != nil && (*c.FinalReleaseHours < 0 || *c.FinalReleaseHours > 7*24) {
+		return fmt.Errorf("routing.reserve-gate.final-release-hours: %d is outside [0, 168]", *c.FinalReleaseHours)
+	}
+	if near, final := c.EffectiveNearReset(), c.EffectiveFinalRelease(); near > 0 && final > near {
+		return fmt.Errorf("routing.reserve-gate.final-release-hours: %v is longer than near-reset-hours %v", final, near)
 	}
 	if c.Hold && !c.Enabled {
 		return fmt.Errorf("routing.reserve-gate.hold: requires routing.reserve-gate.enabled: true")

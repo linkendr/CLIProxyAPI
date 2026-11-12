@@ -72,7 +72,7 @@ func newReserveHomeManager(t *testing.T, gate internalconfig.ReserveGateConfig, 
 // which keeps the caller served while Home has a login with room; the exempt caller is
 // not moved.
 func TestReserveGateHomeDispatchSkipsHeldAccount(t *testing.T) {
-	reset := time.Now().Add(time.Hour)
+	reset := time.Now().Add(25 * time.Hour)
 	dispatcher := &reserveHomeDispatcher{byModel: map[string][]Auth{
 		reserveTestClaudeModel: {reserveHomeAuth("home-held", 0.97, reset), reserveHomeAuth("home-ok", 0.40, reset)},
 	}}
@@ -93,7 +93,7 @@ func TestReserveGateHomeDispatchSkipsHeldAccount(t *testing.T) {
 // When Home has only held Claude accounts, a non-exempt caller gets the reserve 429 on
 // every execution path and no upstream call is made.
 func TestReserveGateHomeDispatchAllHeldReturns429(t *testing.T) {
-	reset := time.Now().Add(90 * time.Minute).Truncate(time.Second)
+	reset := time.Now().Add(26 * time.Hour).Truncate(time.Second)
 	dispatcher := &reserveHomeDispatcher{byModel: map[string][]Auth{
 		reserveTestClaudeModel: {reserveHomeAuth("home-held", 0.97, reset)},
 	}}

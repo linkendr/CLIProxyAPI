@@ -53,7 +53,7 @@ func TestReserveGateRestartKeepsKnownHold(t *testing.T) {
 		t.Run(fmt.Sprintf("mixed=%v", mixed), func(t *testing.T) {
 			authDir := t.TempDir()
 			prefix := reserveStatePrefix()
-			reset := time.Now().Add(2 * time.Hour)
+			reset := time.Now().Add(26 * time.Hour)
 			before := newReserveRigWithConfig(t, &RoundRobinSelector{}, mixed, reserveStateConfig(authDir), prefix)
 			before.manager.Remove(WithSkipPersist(context.Background()), before.credit)
 			markClaudeResult(before.manager, before.a, unifiedHeaders(map[string]float64{"7d": 0.97}, reset))
@@ -72,8 +72,9 @@ func TestReserveGateRestartKeepsKnownHold(t *testing.T) {
 			after.manager.Remove(WithSkipPersist(context.Background()), after.credit)
 			_, err := after.pick(reserveTestUserKey, "", reserveTestClaudeModel)
 			hold := requireReserveHold(t, err)
-			if !hold.resetAt.Equal(reset.Truncate(time.Second)) {
-				t.Fatalf("hold reset = %v, want %v", hold.resetAt, reset.Truncate(time.Second))
+			// Both are under 99%, so they are released when that limit applies, 6 h before reset.
+			if release := reset.Truncate(time.Second).Add(-6 * time.Hour); !hold.resetAt.Equal(release) {
+				t.Fatalf("hold release = %v, want %v", hold.resetAt, release)
 			}
 			if seen := after.picked(t, reserveTestExemptKey, 4); seen[after.a]+seen[after.b] != 4 {
 				t.Fatalf("exempt picks after restart = %v, want the held accounts", seen)
@@ -119,8 +120,8 @@ func TestReserveGateStateFileWithFiveHourEntriesLoads(t *testing.T) {
 	path := write(fmt.Sprintf(`"5h":{"utilization":0.10,"reset_at":%d,"observed_at":%q},"7d":{"utilization":0.96,"reset_at":%d,"observed_at":%q,"held":true,"held_until":%d}`, reset, observed, reset, observed, reset))
 	after := newReserveRigWithConfig(t, &EarliestResetSelector{}, false, reserveStateConfig(authDir), prefix)
 	_, err := after.pick(reserveTestUserKey, "", reserveTestClaudeModel)
-	if hold := requireReserveHold(t, err); hold.resetAt.Unix() != reset {
-		t.Fatalf("hold reset = %v, want %d", hold.resetAt, reset)
+	if hold := requireReserveHold(t, err); hold.resetAt.Unix() != reset-6*3600 {
+		t.Fatalf("hold release = %v, want %d (6 h before reset)", hold.resetAt, reset-6*3600)
 	}
 	markClaudeResult(after.manager, after.a, unifiedHeaders(map[string]float64{"7d": 0.98}, time.Unix(reset, 0)))
 	data, errRead := os.ReadFile(path)
@@ -210,7 +211,7 @@ func TestReserveGateCorruptOrMissingStateFileStartsEmpty(t *testing.T) {
 func TestReserveGateStateFileShape(t *testing.T) {
 	authDir := t.TempDir()
 	rig := newReserveRigWithConfig(t, &EarliestResetSelector{}, false, reserveStateConfig(authDir), reserveStatePrefix())
-	reset := time.Now().Add(time.Hour).Truncate(time.Second)
+	reset := time.Now().Add(25 * time.Hour).Truncate(time.Second)
 	markClaudeResult(rig.manager, rig.a, unifiedHeaders(map[string]float64{"5h": 0.40, "7d": 0.97}, reset))
 	data, errRead := os.ReadFile(filepath.Join(authDir, internalconfig.DefaultReserveGateStateFileName))
 	if errRead != nil {
@@ -233,7 +234,7 @@ func TestReserveGateStateFileShape(t *testing.T) {
 	if file.Version != 1 || len(file.Accounts) != 1 || len(windows) != 1 {
 		t.Fatalf("state file = %s, want version 1 with only the 7d window of %s", data, rig.a)
 	}
-	if w := windows["7d"]; w.Utilization != 0.97 || w.ResetAt != reset.Unix() || w.ObservedAt.IsZero() || !w.Held || w.HeldUntil != reset.Unix() {
+	if w := windows["7d"]; w.Utilization != 0.97 || w.ResetAt != reset.Unix() || w.ObservedAt.IsZero() || !w.Held || w.HeldUntil != reset.Add(-6*time.Hour).Unix() {
 		t.Fatalf("7d entry = %+v", w)
 	}
 }

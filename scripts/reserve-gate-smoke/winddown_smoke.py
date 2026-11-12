@@ -175,7 +175,7 @@ class Upstream:
 class Fixture:
     """One proxy over the shared fake upstream with two OAuth Max logins and a credit key."""
 
-    def __init__(self, binary, run, upstream, ca, seed=None, drained=False, wind_down=None):
+    def __init__(self, binary, run, upstream, ca, seed=None, drained=False, wind_down=None, gate_lines=""):
         self.binary, self.run, self.upstream, self.ca = binary, run, upstream, ca
         run.mkdir(parents=True)
         (run / "auth").mkdir()
@@ -199,7 +199,7 @@ class Fixture:
       models:
         - name: "{MODEL}"
 """ if drained else ""
-        wind = f"    wind-down-minutes: {wind_down}\n" if wind_down is not None else ""
+        wind = (f"    wind-down-minutes: {wind_down}\n" if wind_down is not None else "") + gate_lines
         self.config = run / "config.yaml"
         self.config.write_text(f"""config-version: 8
 server:
@@ -472,6 +472,42 @@ def trigger_off(binary, run, upstream, ca):
         f.stop()
 
 
+def near_reset_limits(binary, run, upstream, ca):
+    """(g) per-login limit by its own reset: 95% while more than 6 h remain, 99% from 6 h to
+    1 h, 100% in the final hour. maxa resets in 30 h, maxb in 5 h, then in 50 minutes."""
+    now = int(time.time())
+    f = Fixture(binary, run / "near-97", upstream, ca, seed={"maxa": (0.97, now + 30 * HOUR), "maxb": (0.97, now + 5 * HOUR)})
+    try:
+        f.check("(g) maxb at 97% with 5 h left is under its 99% limit: new prompt 200 by a Max login", NEW_PROMPT, 200, {"credit"})
+    finally:
+        f.stop()
+    f = Fixture(binary, run / "near-99", upstream, ca, seed={"maxa": (0.97, now + 30 * HOUR), "maxb": (0.99, now + 5 * HOUR)})
+    try:
+        _, _, headers = f.check("(g) maxb at 99% with 5 h left is held, maxa held: new prompt 429", NEW_PROMPT, 429, [],
+                                reserve=True)
+        retry = int(headers.get("Retry-After", "0"))
+        if abs(retry - 4 * HOUR) > 120:
+            raise AssertionError(f"Retry-After {retry}, want about {4 * HOUR} (maxb's final hour)")
+        print(f"PASS (g) Retry-After {retry} names maxb's final hour, 4 h from now", flush=True)
+        f.check("(g) both held: exempt 200 by a Max login", NEW_PROMPT, 200, {"credit"}, automation=True)
+    finally:
+        f.stop()
+    f = Fixture(binary, run / "final-hour", upstream, ca, seed={"maxa": (0.97, now + 30 * HOUR), "maxb": (0.99, now + 50 * 60)})
+    try:
+        f.check("(g) maxb at 99% with 50 minutes left (limit 100%): new prompt 200 by a Max login", NEW_PROMPT, 200, {"credit"})
+    finally:
+        f.stop()
+    lines = "    near-reset-hours: 12\n    near-reset-threshold: 0.98\n    final-release-hours: 2\n"
+    f = Fixture(binary, run / "explicit-keys", upstream, ca, gate_lines=lines,
+                seed={"maxa": (0.97, now + 30 * HOUR), "maxb": (0.97, now + 10 * HOUR)})
+    try:
+        # With the defaults maxb would be held (95%, more than 6 h left); with a 12 h window at 98% it has room.
+        f.check("(g) explicit keys: maxb at 97% with 10 h left is under its 98% limit: new prompt 200", NEW_PROMPT, 200,
+                {"credit"})
+    finally:
+        f.stop()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=pathlib.Path, required=True)
@@ -491,6 +527,7 @@ def main():
     both_limited(binary, run / "c-both-limited", upstream, ca)
     drained_key(binary, run / "d-drained-key", upstream, ca)
     trigger_off(binary, run / "e-trigger-off", upstream, ca)
+    near_reset_limits(binary, run / "g-near-reset", upstream, ca)
     print("ALL PASS: reserve wind-down through real HTTP with fake OAuth logins", flush=True)
 
 

@@ -2,14 +2,23 @@
 
 The reserve gate keeps the last share of the Claude Max logins' weekly quota for automations. Exempt API keys are never gated.
 
-**The rule.** A Max login is *held* once its latest 7-day usage reading reaches `threshold`, until that window resets. A reading whose reset has passed never holds. The reserve is shared across logins:
+**The rule.** A Max login is *held* once its latest 7-day usage reading reaches its *limit*. The limit follows the time left to that login's own weekly reset (from its latest reading):
+
+| Time to the login's reset | Limit | Meaning |
+|---|---|---|
+| more than `near-reset-hours` (6 h) | `threshold` (95%) | the last 5% is kept for automations |
+| `final-release-hours` (1 h) to `near-reset-hours` (6 h) | `near-reset-threshold` (99%) | automations keep the last 1% |
+| `final-release-hours` (1 h) or less | 100% | nothing is kept; every caller may use what is left |
+| no known reset | `threshold` (95%) | |
+
+The limit follows the clock: a held login is released at the step without a new reading. A `threshold` above `near-reset-threshold` wins in the near-reset window. A reading whose reset has passed never holds. The reserve is shared across logins:
 
 - While at least one Max login is not held, nothing is blocked. Ordinary (non-exempt) callers may use any login, including a held one, up to its real upstream limit. The routing strategy picks as usual (pace spends the login that resets first).
 - Only when every Max login is held (or already at a real upstream limit) does the gate act on ordinary callers. This is the *trigger*. While it is on:
-  - **New prompt** (anything that is not a running task): refused, HTTP 429 with the reserve message and `Retry-After` set to the earliest reset among the held logins.
+  - **New prompt** (anything that is not a running task): refused, HTTP 429 with the reserve message and `Retry-After` set to the earliest release among the held logins (the next limit step above its reading, or its reset).
   - **Running task** (the request hands tool results back to the model): served for `wind-down-minutes` after the trigger turned on, in the same credential order as an exempt caller (Max logins up to their real limits, then credit keys once every Max login is at a real limit). The proxy appends one text block to the end of the last user message, after the tool results: "Quota reserve reached. Finish the current step, write a short status of what is done and what is left, and end your turn. Do not start new tool calls or subagents." The system prompt and every earlier byte stay as they were, so the prompt cache prefix is not broken.
   - **Running task after the wind-down**: refused like a new prompt.
-- When the trigger turns off (a weekly reset, or a login reads below the threshold), everything is served again, the note stops and the wind-down clock is cleared, so the next trigger starts a fresh wind-down.
+- When the trigger turns off (a weekly reset, a login reads below its limit, or a login's limit steps up past its reading), everything is served again, the note stops and the wind-down clock is cleared, so the next trigger starts a fresh wind-down.
 
 "Max login" means a Claude subscription (OAuth) login that is not disabled and has no `fallback-when`. A Claude API key (`claude-api-key`) is never a Max login, whatever its priority or `fallback-when`: the credit expiry drain moves an expiring credit key to `priority: 10` and removes its `fallback-when`, and such a key must not count as a login with room. While the trigger is on, a Claude credential that is neither a Max login nor a credit key with `fallback-when` (such a drained key) is blocked for new prompts like a held login, and serves running tasks during the wind-down (it is first in priority) with the note. With no Max login at all there is no reserve and nothing is refused. A disabled login never counts as having room. A login with no reading yet counts as having room. A login cooling down after a real upstream 429 on the shared window does not count as having room.
 
@@ -38,7 +47,10 @@ routing:
   reserve-gate:
     enabled: true            # master switch (false: gate off, nobody refused)
     hold: false              # true: manually refuse all non-exempt Claude requests
-    threshold: 0.95          # a Max login is held at this 7d usage fraction
+    threshold: 0.95          # a Max login is held at this 7d usage fraction while its reset is far
+    near-reset-hours: 6      # from this many hours before a login's reset its limit is near-reset-threshold (0-168; 0 off)
+    near-reset-threshold: 0.99
+    final-release-hours: 1   # from this many hours before a login's reset its limit is 100% (0-168; 0 off; at most near-reset-hours)
     exempt-api-keys: [automation-key]
     wind-down-minutes: 15    # running tasks are served this long after the trigger; 0 refuses them at once (0-1440)
     state-file: ""           # optional; default <auth-dir>/reserve-gate.state

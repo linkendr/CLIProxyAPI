@@ -33,7 +33,7 @@ type reserveStateWindow struct {
 	ResetAt     int64     `json:"reset_at,omitempty"` // Unix seconds; 0 if unknown
 	ObservedAt  time.Time `json:"observed_at"`
 	Held        bool      `json:"held,omitempty"`
-	HeldUntil   int64     `json:"held_until,omitempty"` // Unix seconds; 0 if unknown
+	HeldUntil   int64     `json:"held_until,omitempty"` // Unix seconds the hold lifts (a limit step or the reset); 0 if unknown
 }
 
 // reserveStatePath returns the state file of an enabled gate: state-file, or

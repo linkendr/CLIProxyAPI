@@ -27,6 +27,11 @@ var reserveWindows = [...]string{"7d"}
 type reserveGate struct {
 	hold      bool
 	threshold float64
+	// nearReset and nearThreshold raise a login's limit once its known reset is at most
+	// nearReset away; finalRelease raises it to 1 once its reset is at most that far away.
+	nearReset     time.Duration
+	nearThreshold float64
+	finalRelease  time.Duration
 	// windDown is how long after the trigger turned on running tasks are still served.
 	windDown time.Duration
 	// exempt holds session.CallerScope hashes of the exempt client keys, the same
@@ -38,7 +43,11 @@ func compileReserveGate(cfg internalconfig.ReserveGateConfig) *reserveGate {
 	if !cfg.Enabled {
 		return nil
 	}
-	gate := &reserveGate{hold: cfg.Hold, threshold: cfg.EffectiveThreshold(), windDown: cfg.EffectiveWindDown(), exempt: make(map[string]struct{}, len(cfg.ExemptAPIKeys))}
+	gate := &reserveGate{
+		hold: cfg.Hold, threshold: cfg.EffectiveThreshold(), windDown: cfg.EffectiveWindDown(),
+		nearReset: cfg.EffectiveNearReset(), nearThreshold: math.Max(cfg.EffectiveThreshold(), cfg.EffectiveNearResetThreshold()),
+		finalRelease: cfg.EffectiveFinalRelease(), exempt: make(map[string]struct{}, len(cfg.ExemptAPIKeys)),
+	}
 	for _, key := range cfg.ExemptAPIKeys {
 		if scope := cliproxysession.CallerScope(key); scope != "" {
 			gate.exempt[scope] = struct{}{}
@@ -57,20 +66,54 @@ type reserveReading struct {
 // reserveHold is the hold state of one window of one account.
 type reserveHold struct {
 	held  bool
-	until time.Time // reset of the window the hold belongs to; zero if unknown
+	until time.Time // when the hold lifts without a new reading (a limit step or the reset); zero if unknown
+}
+
+// limit returns the utilization at or above which a login whose window resets at resetAt
+// is held: 1 in the final release, nearThreshold near the reset, threshold otherwise and
+// when the reset is unknown.
+func (g *reserveGate) limit(resetAt, now time.Time) float64 {
+	if resetAt.IsZero() {
+		return g.threshold
+	}
+	left := resetAt.Sub(now)
+	switch {
+	case g.finalRelease > 0 && left <= g.finalRelease:
+		return 1
+	case g.nearReset > 0 && left <= g.nearReset:
+		return g.nearThreshold
+	default:
+		return g.threshold
+	}
+}
+
+// releaseAt returns when a window held at utilization stops being held without a new
+// reading: at the first step whose limit is above utilization, else at its reset.
+func (g *reserveGate) releaseAt(utilization float64, resetAt time.Time) time.Time {
+	if g.nearReset > 0 && utilization < g.nearThreshold {
+		return resetAt.Add(-g.nearReset)
+	}
+	if g.finalRelease > 0 && utilization < 1 {
+		return resetAt.Add(-g.finalRelease)
+	}
+	return resetAt
 }
 
 // nextReserveHold decides whether a window is held from its newest reading: at or above
-// threshold, until the window resets. A reading whose reset has passed describes a
-// window that already rolled over, so it never holds.
-func nextReserveHold(reading reserveReading, ok bool, threshold float64, now time.Time) reserveHold {
+// the gate's limit for the time left to its reset, until that limit rises above the
+// reading or the window resets. A reading whose reset has passed describes a window
+// that already rolled over, so it never holds.
+func nextReserveHold(reading reserveReading, ok bool, gate *reserveGate, now time.Time) reserveHold {
 	if !ok || (!reading.resetAt.IsZero() && !reading.resetAt.After(now)) {
 		return reserveHold{}
 	}
-	if reading.utilization >= threshold {
-		return reserveHold{held: true, until: reading.resetAt}
+	if reading.utilization < gate.limit(reading.resetAt, now) {
+		return reserveHold{}
 	}
-	return reserveHold{}
+	if reading.resetAt.IsZero() {
+		return reserveHold{held: true}
+	}
+	return reserveHold{held: true, until: gate.releaseAt(reading.utilization, reading.resetAt)}
 }
 
 // latestReserveReading returns the newest reading of window in the snapshots of auth.
@@ -141,7 +184,7 @@ type reserveHoldBook struct {
 // update merges the live reading of one account window into the book, decides its hold
 // and returns it. The newer of the live and the known reading wins. Transitions are
 // logged so an operator can see when an account reaches and leaves the reserve.
-func (b *reserveHoldBook) update(authID, window string, live reserveReading, liveOK bool, threshold float64, now time.Time) reserveHold {
+func (b *reserveHoldBook) update(authID, window string, live reserveReading, liveOK bool, gate *reserveGate, now time.Time) reserveHold {
 	key := reserveKey{authID: authID, window: window}
 	b.mu.Lock()
 	reading, ok := b.readings[key]
@@ -155,7 +198,7 @@ func (b *reserveHoldBook) update(authID, window string, live reserveReading, liv
 		reading, ok = live, true
 	}
 	prev := b.holds[key]
-	next := nextReserveHold(reading, ok, threshold, now)
+	next := nextReserveHold(reading, ok, gate, now)
 	if next.held {
 		if b.holds == nil {
 			b.holds = make(map[reserveKey]reserveHold)
@@ -193,7 +236,7 @@ func (m *Manager) recordReserveReadings(auth *Auth) {
 	now := time.Now()
 	for _, window := range reserveWindows {
 		if reading, ok := latestReserveReading(auth, window); ok {
-			m.reserveHolds.update(auth.ID, window, reading, ok, gate.threshold, now)
+			m.reserveHolds.update(auth.ID, window, reading, ok, gate, now)
 		}
 	}
 	m.observeReserveTrigger(gate, now)
@@ -212,7 +255,7 @@ type reserveLogin struct {
 }
 
 // reserveAccount is the evaluated hold of one account: until is when it is expected to
-// be released (the latest reset among its held windows), zero if unknown.
+// be released (the latest release among its held windows), zero if unknown.
 type reserveAccount struct {
 	held  bool
 	until time.Time
@@ -352,7 +395,7 @@ func (c *reserveCheck) holdOf(authID string, live func(window int) (reserveReadi
 	unknown := false
 	for index, window := range reserveWindows {
 		reading, ok := live(index)
-		state := c.book.update(authID, window, reading, ok, c.gate.threshold, c.now)
+		state := c.book.update(authID, window, reading, ok, c.gate, c.now)
 		if !state.held {
 			continue
 		}
@@ -451,7 +494,8 @@ func (c *reserveCheck) holdError(gated []*Auth) error {
 type reserveHoldError struct {
 	// manual is true for routing.reserve-gate.hold.
 	manual bool
-	// resetAt is the earliest time a held account is expected to be released; zero if unknown.
+	// resetAt is the earliest time a held account is expected to be released (a limit step
+	// or a reset); zero if unknown.
 	resetAt time.Time
 	now     time.Time
 }
@@ -462,7 +506,7 @@ func (e *reserveHoldError) message() string {
 	}
 	message := "quota reserve hold: interactive Claude use is paused to preserve quota for automations"
 	if !e.resetAt.IsZero() {
-		message += "; resets at " + formatReserveReset(e.resetAt)
+		message += "; available again at " + formatReserveReset(e.resetAt)
 	}
 	return message
 }

@@ -61,6 +61,51 @@ func TestParseConfigRejectsInvalidReserveGate(t *testing.T) {
 	}
 }
 
+func TestParseConfigReserveGateNearResetKeys(t *testing.T) {
+	cfg, err := ParseConfigBytes([]byte("routing:\n  reserve-gate:\n    enabled: true\n    near-reset-hours: 8\n    near-reset-threshold: 0.98\n    final-release-hours: 2\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := cfg.Routing.ReserveGate
+	if got := gate.EffectiveNearReset(); got != 8*time.Hour {
+		t.Fatalf("near reset window = %v, want 8h", got)
+	}
+	if got := gate.EffectiveNearResetThreshold(); got != 0.98 {
+		t.Fatalf("near reset threshold = %v, want 0.98", got)
+	}
+	if got := gate.EffectiveFinalRelease(); got != 2*time.Hour {
+		t.Fatalf("final release window = %v, want 2h", got)
+	}
+	defaults := ReserveGateConfig{}
+	if defaults.EffectiveNearReset() != 6*time.Hour || defaults.EffectiveNearResetThreshold() != 0.99 || defaults.EffectiveFinalRelease() != time.Hour {
+		t.Fatalf("defaults = %v, %v, %v; want 6h, 0.99, 1h", defaults.EffectiveNearReset(), defaults.EffectiveNearResetThreshold(), defaults.EffectiveFinalRelease())
+	}
+}
+
+func TestParseConfigRejectsInvalidNearResetKeys(t *testing.T) {
+	for name, tt := range map[string]struct {
+		gate string
+		want string
+	}{
+		"near hours negative":        {"enabled: true\n    near-reset-hours: -1", "near-reset-hours"},
+		"near hours above a week":    {"enabled: true\n    near-reset-hours: 169", "near-reset-hours"},
+		"near hours not a number":    {"enabled: true\n    near-reset-hours: 6h", "cannot unmarshal !!str `6h`"},
+		"near threshold above one":   {"enabled: true\n    near-reset-threshold: 99", "near-reset-threshold"},
+		"near threshold negative":    {"enabled: true\n    near-reset-threshold: -0.99", "near-reset-threshold"},
+		"final hours negative":       {"enabled: true\n    final-release-hours: -1", "final-release-hours"},
+		"final longer than near":     {"enabled: true\n    near-reset-hours: 2\n    final-release-hours: 3", "final-release-hours"},
+		"misspelt near reset window": {"enabled: true\n    near-reset-hour: 6", "near-reset-hour"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			raw := "routing:\n  reserve-gate:\n    " + tt.gate + "\n"
+			_, err := ParseConfigBytes([]byte(raw))
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("ParseConfigBytes error = %v, want one naming %s", err, tt.want)
+			}
+		})
+	}
+}
+
 // The removed hysteresis, release and weekly relaxation keys are unknown now: a config
 // that still sets one must fail instead of silently losing its meaning.
 func TestParseConfigRejectsRemovedReserveGateKeys(t *testing.T) {

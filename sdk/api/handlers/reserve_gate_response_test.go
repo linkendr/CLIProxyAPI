@@ -43,14 +43,15 @@ func (reserveGateResponseExecutor) HttpRequest(context.Context, *coreauth.Auth, 
 }
 
 // A request the reserve gate refuses reaches the client as a 429 with the Anthropic
-// error body, the hold message and a Retry-After for the earliest reset.
+// error body, the hold message and a Retry-After for the earliest release: at 99% with
+// 3 h left, the login is released in its final hour, 2 h from now.
 func TestReserveGateHoldReachesClientAs429(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	const model = "reserve-gate-response-model"
 	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
 	manager.SetConfig(&internalconfig.Config{Routing: internalconfig.RoutingConfig{ReserveGate: internalconfig.ReserveGateConfig{Enabled: true}}})
 	manager.RegisterExecutor(reserveGateResponseExecutor{})
-	reset := time.Now().Add(2 * time.Hour).Truncate(time.Second)
+	reset := time.Now().Add(3 * time.Hour).Truncate(time.Second)
 	auth := &coreauth.Auth{
 		ID: "reserve-gate-response-oauth", Provider: "claude", Status: coreauth.StatusActive,
 		Attributes: map[string]string{"auth_kind": "oauth"},
@@ -93,7 +94,7 @@ func TestReserveGateHoldReachesClientAs429(t *testing.T) {
 	if errJSON := json.Unmarshal(recorder.Body.Bytes(), &body); errJSON != nil {
 		t.Fatalf("body %q: %v", recorder.Body.String(), errJSON)
 	}
-	if body.Error.Type != "rate_limit_error" || !strings.Contains(body.Error.Message, "quota reserve hold") || !strings.Contains(body.Error.Message, reset.UTC().Format(time.RFC3339)) {
-		t.Fatalf("body = %s, want rate_limit_error naming the hold and its reset", recorder.Body.String())
+	if body.Error.Type != "rate_limit_error" || !strings.Contains(body.Error.Message, "quota reserve hold") || !strings.Contains(body.Error.Message, reset.Add(-time.Hour).UTC().Format(time.RFC3339)) {
+		t.Fatalf("body = %s, want rate_limit_error naming the hold and its release", recorder.Body.String())
 	}
 }
