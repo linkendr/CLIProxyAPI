@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
@@ -3058,7 +3059,7 @@ func isTransientTransportMessage(message string) bool {
 }
 
 func isUnauthorizedError(err error) bool {
-	if err == nil {
+	if err == nil || codex.IsRefreshPreSendError(err) {
 		return false
 	}
 	if statusCodeFromError(err) == http.StatusUnauthorized {
@@ -3193,7 +3194,7 @@ func isTerminalRefreshGrantMessage(message string) bool {
 }
 
 func isTerminalRefreshError(auth *Auth, err error) bool {
-	if err == nil {
+	if err == nil || codex.IsRefreshPreSendError(err) {
 		return false
 	}
 	var partErr interface {
@@ -3432,7 +3433,7 @@ func isInvalidGrantErrorMessage(message string) bool {
 }
 
 func isInvalidGrantError(err error) bool {
-	if err == nil {
+	if err == nil || codex.IsRefreshPreSendError(err) {
 		return false
 	}
 	if !isInvalidGrantErrorMessage(err.Error()) {
