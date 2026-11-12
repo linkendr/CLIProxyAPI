@@ -2,23 +2,27 @@
 
 The reserve gate keeps the last share of the Claude Max logins' weekly quota for automations. Exempt API keys are never gated.
 
-**The rule.** A Max login is *held* once its latest 7-day usage reading reaches its *limit*. The limit follows the time left to that login's own weekly reset (from its latest reading):
+**The rule.** The Max logins keep one shared *reserve*, not one each. Its size follows the time left to the *next* weekly reset of any Max login (from the latest readings), because that reset brings fresh capacity:
 
-| Time to the login's reset | Limit | Meaning |
+| Time to the next reset of any Max login | Reserve | Meaning |
 |---|---|---|
-| more than `near-reset-hours` (6 h) | `threshold` (95%) | the last 5% is kept for automations |
-| `final-release-hours` (1 h) to `near-reset-hours` (6 h) | `near-reset-threshold` (99%) | automations keep the last 1% |
-| `final-release-hours` (1 h) or less | 100% | nothing is kept; every caller may use what is left |
-| no known reset | `threshold` (95%) | |
+| more than `near-reset-hours` (6 h) | 1 - `threshold` (5%) | automations keep the last 5% of one login |
+| `final-release-hours` (1 h) to `near-reset-hours` (6 h) | 1 - `near-reset-threshold` (1%) | automations keep the last 1% |
+| `final-release-hours` (1 h) or less | 0 | nothing is kept; every caller may use what is left |
+| no known reset | 1 - `threshold` (5%) | |
 
-The limit follows the clock: a held login is released at the step without a new reading. A `threshold` above `near-reset-threshold` wins in the near-reset window. A reading whose reset has passed never holds. The reserve is shared across logins:
+The reserve is placed on the logins that reset last (a login with no known reset counts as last): each takes up to its own headroom (1 - its 7-day utilization) until the reserve is placed. A login is *held* when all its headroom is reserve. So the login that resets first is spent first, and the logins that reset later keep the reserve until fresh capacity arrives. With one Max login this is a per-login limit of 95%, 99% and 100%. A `threshold` above `near-reset-threshold` wins in the near-reset window.
 
-- While at least one Max login is not held, nothing is blocked. Ordinary (non-exempt) callers may use any login, including a held one, up to its real upstream limit. The routing strategy picks as usual (pace spends the login that resets first).
-- Only when every Max login is held (or already at a real upstream limit) does the gate act on ordinary callers. This is the *trigger*. While it is on:
-  - **New prompt** (anything that is not a running task): refused, HTTP 429 with the reserve message and `Retry-After` set to the earliest release among the held logins (the next limit step above its reading, or its reset).
+Example: the work login has 2% left and resets in 9 h; the general login has 4% left and resets in 26 h. The reserve is 5%: the general login holds 4% and the work login 1%, so ordinary callers may use 1% of the work login. From 6 h before the work login's reset the reserve is 1%, all on the general login, so ordinary callers may use the rest of the work login and 3% of the general login. In the last hour nothing is kept. Once the work login resets it is fresh and holds the reserve, so the general login's last 4% is free.
+
+The reserve follows the clock: a held login is released at the step that frees it, without a new reading. A reading whose reset has passed counts as a fresh window (all headroom). A login cooling down after a real upstream 429 on the shared window has no headroom, whatever its reading says. A login with no reading yet takes no part and is not held.
+
+- While at least one Max login is not held, that is while the logins together have more than the reserve left, nothing is blocked. Ordinary (non-exempt) callers may use any login, including a held one, up to its real upstream limit. The routing strategy picks as usual (pace spends the login that resets first).
+- Only when every Max login is held (the logins have no more than the reserve left) does the gate act on ordinary callers. This is the *trigger*. While it is on:
+  - **New prompt** (anything that is not a running task): refused, HTTP 429 with the reserve message and `Retry-After` set to the earliest release among the held logins (the next reserve step that frees one, or the next reset).
   - **Running task** (the request hands tool results back to the model): served for `wind-down-minutes` after the trigger turned on, in the same credential order as an exempt caller (Max logins up to their real limits, then credit keys once every Max login is at a real limit). The proxy appends one text block to the end of the last user message, after the tool results: "Quota reserve reached. Finish the current step, write a short status of what is done and what is left, and end your turn. Do not start new tool calls or subagents." The system prompt and every earlier byte stay as they were, so the prompt cache prefix is not broken.
   - **Running task after the wind-down**: refused like a new prompt.
-- When the trigger turns off (a weekly reset, a login reads below its limit, or a login's limit steps up past its reading), everything is served again, the note stops and the wind-down clock is cleared, so the next trigger starts a fresh wind-down.
+- When the trigger turns off (a weekly reset, a login reads lower, or the reserve steps down), everything is served again, the note stops and the wind-down clock is cleared, so the next trigger starts a fresh wind-down.
 
 "Max login" means a Claude subscription (OAuth) login that is not disabled and has no `fallback-when`. A Claude API key (`claude-api-key`) is never a Max login, whatever its priority or `fallback-when`: the credit expiry drain moves an expiring credit key to `priority: 10` and removes its `fallback-when`, and such a key must not count as a login with room. While the trigger is on, a Claude credential that is neither a Max login nor a credit key with `fallback-when` (such a drained key) is blocked for new prompts like a held login, and serves running tasks during the wind-down (it is first in priority) with the note. With no Max login at all there is no reserve and nothing is refused. A disabled login never counts as having room. A login with no reading yet counts as having room. A login cooling down after a real upstream 429 on the shared window does not count as having room.
 
@@ -38,7 +42,7 @@ Paid credit keys (`fallback-when`) are not part of the reserve. They serve every
 
 `hold: true` is a manual pause: every Claude credential, credit keys included, is refused to ordinary callers with 429 and no `Retry-After`, running tasks included (no wind-down). Codex (GPT) routes are unaffected. The block hot-reloads.
 
-Under Home dispatch the control center owns the credential list, so the gate applies to each pick: a held login Home offers is passed over and Home is asked again. Ordinary callers are refused once Home has no unheld Max login left. Credit keys stay blocked there, since Home does not apply `fallback-when`. The trigger and the wind-down are not known under Home: running tasks are gated like new prompts there.
+Under Home dispatch the control center owns the credential list, so the gate cannot see the pool: each login Home offers keeps its own reserve (a pool of one, so 95%, 99% or 100% by its own reset). A held login Home offers is passed over and Home is asked again. Ordinary callers are refused once Home has no unheld Max login left. Credit keys stay blocked there, since Home does not apply `fallback-when`. The trigger and the wind-down are not known under Home: running tasks are gated like new prompts there.
 
 ## Config
 
@@ -47,10 +51,10 @@ routing:
   reserve-gate:
     enabled: true            # master switch (false: gate off, nobody refused)
     hold: false              # true: manually refuse all non-exempt Claude requests
-    threshold: 0.95          # a Max login is held at this 7d usage fraction while its reset is far
-    near-reset-hours: 6      # from this many hours before a login's reset its limit is near-reset-threshold (0-168; 0 off)
+    threshold: 0.95          # the shared reserve is 1 - threshold while the next reset of any Max login is far
+    near-reset-hours: 6      # from this many hours before the next reset the reserve is 1 - near-reset-threshold (0-168; 0 off)
     near-reset-threshold: 0.99
-    final-release-hours: 1   # from this many hours before a login's reset its limit is 100% (0-168; 0 off; at most near-reset-hours)
+    final-release-hours: 1   # from this many hours before the next reset no reserve is kept (0-168; 0 off; at most near-reset-hours)
     exempt-api-keys: [automation-key]
     wind-down-minutes: 15    # running tasks are served this long after the trigger; 0 refuses them at once (0-1440)
     state-file: ""           # optional; default <auth-dir>/reserve-gate.state
@@ -64,11 +68,11 @@ These are admission limits based on the latest reported utilization, not token b
 
 ## State across restarts
 
-The gate keeps, per account and window (`7d`), the last reading it saw (utilization, reset, observed time) and whether the window is held. It writes them to the state file whenever a utilization, a reset or a hold changes, and reads the file when the gate starts. A restart therefore keeps every known hold: a login last seen at 0.97 counts as held before any new response arrives.
+The gate keeps, per account and window (`7d`), the last reading it saw (utilization, reset, observed time) and whether the window is held. It writes them to the state file whenever a utilization, a reset or a hold changes, and reads the file when the gate starts. A restart therefore keeps every known reading: the pool is decided from them before any new response arrives.
 
 - File: `state-file`, or `reserve-gate.state` in `auth-dir` when unset. It is not a `.json` file, so the credential loader ignores it. Written by atomic replace, mode 0600. It holds account IDs, numbers and times; no tokens or keys. With neither `auth-dir` nor `state-file` set the gate logs a warning and keeps state in memory only.
 - Partial responses: a response whose headers lack one window's utilization does not erase that window's known reading. Only a newer reading of the same window replaces it.
-- Reset: a reading whose reset time has passed counts as reset, so the window does not hold. Such readings are dropped when the file is read.
+- Reset: a reading whose reset time has passed counts as reset, so the window has all its headroom. Such readings are dropped when the file is read.
 - No reading: a login with no reading at all (never seen, or seen only before the state file existed) is not held and counts as having room. Its first response fills the book.
 - Missing or unreadable file: the gate starts empty and logs the path (`starting empty`); the proxy keeps running.
 - Older files: `5h` entries and fields this build does not know are ignored when the file is read and dropped on the next write.
@@ -90,7 +94,7 @@ bash scripts/reserve-gate-smoke/smoke.sh
 bash scripts/reserve-gate-smoke/winddown_smoke.sh <new dir>
 ```
 
-Max logins are subscription (OAuth) logins, and an OAuth login always talks to `https://api.anthropic.com`. `winddown_smoke.sh` therefore builds the checkout for Linux and runs it in a `golang` container with no network (`--network none`): `api.anthropic.com` resolves to the container's loopback, where `winddown_smoke.py` serves a fake HTTPS upstream with a certificate from a throwaway CA the proxy trusts through `SSL_CERT_FILE`. Two fake OAuth login files and a fake credit key (`fallback-when: limit`) stand in. Scenarios, each on a fresh proxy: both logins held (new prompt 429, running task served by a login with the note at the end of the last user message, exempt served, OpenAI-format running task served with the note); after the wind-down (`wind-down-minutes: 1`) running task 429, exempt served; both at a real limit (running task served by the credit key, no note); a drained credit key at priority 10 without `fallback-when` plus both held (new prompt 429; running task served by the drained key with the note); one login with room (new prompt and running task served, no note); restart (the held readings come back from the state file).
+Max logins are subscription (OAuth) logins, and an OAuth login always talks to `https://api.anthropic.com`. `winddown_smoke.sh` therefore builds the checkout for Linux and runs it in a `golang` container with no network (`--network none`): `api.anthropic.com` resolves to the container's loopback, where `winddown_smoke.py` serves a fake HTTPS upstream with a certificate from a throwaway CA the proxy trusts through `SSL_CERT_FILE`. Two fake OAuth login files and a fake credit key (`fallback-when: limit`) stand in. Scenarios, each on a fresh proxy: both logins held (new prompt 429, running task served by a login with the note at the end of the last user message, exempt served, OpenAI-format running task served with the note); after the wind-down (`wind-down-minutes: 1`) running task 429, exempt served; both at a real limit (running task served by the credit key, no note); a drained credit key at priority 10 without `fallback-when` plus both held (new prompt 429; running task served by the drained key with the note); one login with room (new prompt and running task served, no note); restart (the held readings come back from the state file); the shared reserve (one login spent while the later one holds the reserve, the pool at the reserve with `Retry-After` at the 1% step, the near-reset and final-hour steps, explicit keys).
 
 `smoke.sh` runs on the host with fake API keys only. Since API keys are not Max logins, it checks that a `claude-api-key` at 0.97 is never reserve-held, plus the manual hold, hot reload, the Codex route and the state file across a restart.
 

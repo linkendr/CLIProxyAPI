@@ -44,8 +44,8 @@ func windDownFlag(meta map[string]any) bool {
 
 func (r *reserveRig) bothHeld(t *testing.T) {
 	t.Helper()
-	r.observe(t, r.a, "7d", 0.97, time.Now().Add(48*time.Hour))
-	r.observe(t, r.b, "7d", 0.96, time.Now().Add(72*time.Hour))
+	r.observe(t, r.a, "7d", 0.98, time.Now().Add(48*time.Hour))
+	r.observe(t, r.b, "7d", 0.99, time.Now().Add(72*time.Hour))
 }
 
 // addDrainedKey registers a Claude API key the way the credit expiry drain leaves one:
@@ -242,7 +242,7 @@ func TestReserveWindDownClockStartsFromRecordedResponse(t *testing.T) {
 	reset := time.Now().Add(48 * time.Hour)
 	for _, id := range []string{rig.a, rig.b} {
 		ctx := internallogging.WithResponseHeadersHolder(context.Background())
-		internallogging.SetResponseHeaders(ctx, unifiedHeaders(map[string]float64{"7d": 0.97}, reset))
+		internallogging.SetResponseHeaders(ctx, unifiedHeaders(map[string]float64{"7d": 0.98}, reset))
 		rig.manager.MarkResult(ctx, Result{AuthID: id, Provider: "claude", Model: reserveTestClaudeModel, Success: true})
 	}
 	if rig.manager.reserveTrigger.since.IsZero() {

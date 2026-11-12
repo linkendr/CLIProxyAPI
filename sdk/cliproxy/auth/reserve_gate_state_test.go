@@ -56,8 +56,8 @@ func TestReserveGateRestartKeepsKnownHold(t *testing.T) {
 			reset := time.Now().Add(26 * time.Hour)
 			before := newReserveRigWithConfig(t, &RoundRobinSelector{}, mixed, reserveStateConfig(authDir), prefix)
 			before.manager.Remove(WithSkipPersist(context.Background()), before.credit)
-			markClaudeResult(before.manager, before.a, unifiedHeaders(map[string]float64{"7d": 0.97}, reset))
-			markClaudeResult(before.manager, before.b, unifiedHeaders(map[string]float64{"7d": 0.96}, reset))
+			markClaudeResult(before.manager, before.a, unifiedHeaders(map[string]float64{"7d": 0.98}, reset))
+			markClaudeResult(before.manager, before.b, unifiedHeaders(map[string]float64{"7d": 0.99}, reset))
 
 			path := filepath.Join(authDir, internalconfig.DefaultReserveGateStateFileName)
 			info, errStat := os.Stat(path)
@@ -72,7 +72,7 @@ func TestReserveGateRestartKeepsKnownHold(t *testing.T) {
 			after.manager.Remove(WithSkipPersist(context.Background()), after.credit)
 			_, err := after.pick(reserveTestUserKey, "", reserveTestClaudeModel)
 			hold := requireReserveHold(t, err)
-			// Both are under 99%, so they are released when that limit applies, 6 h before reset.
+			// Together they have 3% left, above the 1% reserve that applies 6 h before reset.
 			if release := reset.Truncate(time.Second).Add(-6 * time.Hour); !hold.resetAt.Equal(release) {
 				t.Fatalf("hold release = %v, want %v", hold.resetAt, release)
 			}
@@ -94,7 +94,7 @@ func TestReserveGateStateFileWithFiveHourEntriesLoads(t *testing.T) {
 	write := func(bWindows string) string {
 		state := fmt.Sprintf(`{"version":1,"updated_at":%q,"accounts":{
   %q:{"5h":{"utilization":0.10,"reset_at":%d,"observed_at":%q},
-      "7d":{"utilization":0.97,"reset_at":%d,"observed_at":%q,"held":true,"held_until":%d,"retry_at":%d}},
+      "7d":{"utilization":0.98,"reset_at":%d,"observed_at":%q,"held":true,"held_until":%d,"retry_at":%d}},
   %q:{%s}}}`, observed, prefix+"a", reset, observed, reset, observed, reset, reset, prefix+"b", bWindows)
 		path := filepath.Join(authDir, internalconfig.DefaultReserveGateStateFileName)
 		if errWrite := os.WriteFile(path, []byte(state), 0o600); errWrite != nil {
@@ -117,7 +117,7 @@ func TestReserveGateStateFileWithFiveHourEntriesLoads(t *testing.T) {
 	}
 
 	// b held on 7d too: after the restart both are held from the file alone.
-	path := write(fmt.Sprintf(`"5h":{"utilization":0.10,"reset_at":%d,"observed_at":%q},"7d":{"utilization":0.96,"reset_at":%d,"observed_at":%q,"held":true,"held_until":%d}`, reset, observed, reset, observed, reset))
+	path := write(fmt.Sprintf(`"5h":{"utilization":0.10,"reset_at":%d,"observed_at":%q},"7d":{"utilization":0.99,"reset_at":%d,"observed_at":%q,"held":true,"held_until":%d}`, reset, observed, reset, observed, reset))
 	after := newReserveRigWithConfig(t, &EarliestResetSelector{}, false, reserveStateConfig(authDir), prefix)
 	_, err := after.pick(reserveTestUserKey, "", reserveTestClaudeModel)
 	if hold := requireReserveHold(t, err); hold.resetAt.Unix() != reset-6*3600 {
@@ -137,8 +137,8 @@ func TestReserveGateStateFileWithFiveHourEntriesLoads(t *testing.T) {
 func TestReserveGatePartialSnapshotKeepsKnownWindow(t *testing.T) {
 	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
 		reset := time.Now().Add(48 * time.Hour)
-		markClaudeResult(rig.manager, rig.b, unifiedHeaders(map[string]float64{"7d": 0.97}, reset))
-		markClaudeResult(rig.manager, rig.a, unifiedHeaders(map[string]float64{"7d": 0.97}, reset))
+		markClaudeResult(rig.manager, rig.b, unifiedHeaders(map[string]float64{"7d": 0.98}, reset))
+		markClaudeResult(rig.manager, rig.a, unifiedHeaders(map[string]float64{"7d": 0.98}, reset))
 		if _, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel); err == nil {
 			t.Fatal("both held on 7d must refuse the non-exempt caller")
 		}

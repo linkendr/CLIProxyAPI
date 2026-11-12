@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -87,33 +88,86 @@ func (g *reserveGate) limit(resetAt, now time.Time) float64 {
 	}
 }
 
-// releaseAt returns when a window held at utilization stops being held without a new
-// reading: at the first step whose limit is above utilization, else at its reset.
-func (g *reserveGate) releaseAt(utilization float64, resetAt time.Time) time.Time {
-	if g.nearReset > 0 && utilization < g.nearThreshold {
-		return resetAt.Add(-g.nearReset)
-	}
-	if g.finalRelease > 0 && utilization < 1 {
-		return resetAt.Add(-g.finalRelease)
-	}
-	return resetAt
+// reserveEpsilon absorbs float error when a share is compared with a headroom: both are
+// differences of readings that carry two decimals.
+const reserveEpsilon = 1e-9
+
+// reservePoolEntry is one Max login's window in the shared reserve.
+type reservePoolEntry struct {
+	id       string
+	headroom float64   // 1 - utilization, at least 0; 0 at a real limit
+	resetAt  time.Time // zero if unknown
 }
 
-// nextReserveHold decides whether a window is held from its newest reading: at or above
-// the gate's limit for the time left to its reset, until that limit rises above the
-// reading or the window resets. A reading whose reset has passed describes a window
-// that already rolled over, so it never holds.
-func nextReserveHold(reading reserveReading, ok bool, gate *reserveGate, now time.Time) reserveHold {
-	if !ok || (!reading.resetAt.IsZero() && !reading.resetAt.After(now)) {
-		return reserveHold{}
+// reserveAt returns the shared reserve when the next reset of any Max login is at next:
+// 1 - limit, so a pool of one login is held exactly at its own limit.
+func (g *reserveGate) reserveAt(next, now time.Time) float64 {
+	return 1 - g.limit(next, now)
+}
+
+// placeReserve places reserve on the entries that reset last (an unknown reset counts as
+// latest), each taking up to its headroom, and reports per entry whether all its headroom
+// is reserve: held.
+func placeReserve(entries []reservePoolEntry, reserve float64) []bool {
+	order := make([]int, len(entries))
+	for i := range order {
+		order[i] = i
 	}
-	if reading.utilization < gate.limit(reading.resetAt, now) {
-		return reserveHold{}
+	sort.Slice(order, func(x, y int) bool {
+		a, b := entries[order[x]], entries[order[y]]
+		switch {
+		case a.resetAt.Equal(b.resetAt):
+			return a.id < b.id
+		case a.resetAt.IsZero() || b.resetAt.IsZero():
+			return a.resetAt.IsZero()
+		default:
+			return a.resetAt.After(b.resetAt)
+		}
+	})
+	held := make([]bool, len(entries))
+	left := reserve
+	for _, i := range order {
+		share := math.Min(entries[i].headroom, math.Max(left, 0))
+		held[i] = entries[i].headroom <= share+reserveEpsilon
+		left -= share
 	}
-	if reading.resetAt.IsZero() {
-		return reserveHold{held: true}
+	return held
+}
+
+// poolHolds decides the hold of every entry of one window. The reserve follows the time
+// left to the next known reset of any entry, since that reset brings fresh capacity. A
+// held entry is released at the first limit step that frees it, else at that next reset;
+// its release is unknown when no entry has a known reset.
+func (g *reserveGate) poolHolds(entries []reservePoolEntry, now time.Time) []reserveHold {
+	var next time.Time
+	for _, entry := range entries {
+		if !entry.resetAt.IsZero() && (next.IsZero() || entry.resetAt.Before(next)) {
+			next = entry.resetAt
+		}
 	}
-	return reserveHold{held: true, until: gate.releaseAt(reading.utilization, reading.resetAt)}
+	held := placeReserve(entries, g.reserveAt(next, now))
+	var steps []time.Time
+	if !next.IsZero() {
+		for _, before := range []time.Duration{g.nearReset, g.finalRelease} {
+			if step := next.Add(-before); before > 0 && step.After(now) {
+				steps = append(steps, step)
+			}
+		}
+	}
+	holds := make([]reserveHold, len(entries))
+	for i := range entries {
+		if !held[i] {
+			continue
+		}
+		holds[i] = reserveHold{held: true, until: next}
+		for _, step := range steps {
+			if !placeReserve(entries, g.reserveAt(next, step))[i] {
+				holds[i].until = step
+				break
+			}
+		}
+	}
+	return holds
 }
 
 // latestReserveReading returns the newest reading of window in the snapshots of auth.
@@ -169,58 +223,137 @@ type reserveKey struct {
 // hold. A response that lacks a window's utilization does not erase the known reading
 // of that window. With a state file set, every change of a reading's utilization or
 // reset, or of a hold, is written to it, and it is read when the gate starts, so a
-// restart keeps known holds. An account with no reading at all is not held: its first
-// response fills the book.
+// restart keeps known readings and holds. An account with no reading at all is not
+// held: its first response fills the book.
 type reserveHoldBook struct {
 	mu       sync.Mutex
 	readings map[reserveKey]reserveReading
 	holds    map[reserveKey]reserveHold
+	// dirty reports a reading or hold change the state file does not have yet.
+	dirty bool
 	// path is the state file; empty means the book is kept in memory only.
 	path string
 	// saveMu orders state file writes so the last write carries the newest book.
 	saveMu sync.Mutex
 }
 
-// update merges the live reading of one account window into the book, decides its hold
-// and returns it. The newer of the live and the known reading wins. Transitions are
-// logged so an operator can see when an account reaches and leaves the reserve.
-func (b *reserveHoldBook) update(authID, window string, live reserveReading, liveOK bool, gate *reserveGate, now time.Time) reserveHold {
-	key := reserveKey{authID: authID, window: window}
-	b.mu.Lock()
+// mergeLocked merges a live reading into the book and returns the newest known reading
+// of key. The newer of the live and the known reading wins. The caller holds b.mu.
+func (b *reserveHoldBook) mergeLocked(key reserveKey, live reserveReading, liveOK bool) (reserveReading, bool) {
 	reading, ok := b.readings[key]
-	changed := false
-	if liveOK && (!ok || !live.observedAt.Before(reading.observedAt)) {
-		changed = !ok || live.utilization != reading.utilization || !live.resetAt.Equal(reading.resetAt)
-		if b.readings == nil {
-			b.readings = make(map[reserveKey]reserveReading)
-		}
-		b.readings[key] = live
-		reading, ok = live, true
+	if !liveOK || (ok && live.observedAt.Before(reading.observedAt)) {
+		return reading, ok
 	}
-	prev := b.holds[key]
-	next := nextReserveHold(reading, ok, gate, now)
-	if next.held {
-		if b.holds == nil {
-			b.holds = make(map[reserveKey]reserveHold)
-		}
-		b.holds[key] = next
-	} else {
-		delete(b.holds, key)
+	if !ok || live.utilization != reading.utilization || !live.resetAt.Equal(reading.resetAt) {
+		b.dirty = true
 	}
-	changed = changed || next.held != prev.held || !next.until.Equal(prev.until)
-	persist := changed && b.path != ""
+	if b.readings == nil {
+		b.readings = make(map[reserveKey]reserveReading)
+	}
+	b.readings[key] = live
+	return live, true
+}
+
+// merge merges a live reading of one account window into the book.
+func (b *reserveHoldBook) merge(authID, window string, live reserveReading) {
+	b.mu.Lock()
+	b.mergeLocked(reserveKey{authID: authID, window: window}, live, true)
 	b.mu.Unlock()
-	if next.held != prev.held {
+}
+
+// evaluate merges the live readings of logins into the book and decides the hold of each
+// login from the shared reserve of their windows (poolHolds, one pool per window). A
+// login with neither a reading nor a real limit takes no part and is not held. A login
+// at a real limit has no headroom whatever its reading says; a reading whose reset has
+// passed describes a window that already rolled over, so it has all its headroom.
+// Transitions are logged so an operator can see when a login reaches and leaves the
+// reserve, and a change is written to the state file.
+func (b *reserveHoldBook) evaluate(gate *reserveGate, now time.Time, logins []reserveLogin) map[string]reserveAccount {
+	type transition struct {
+		key     reserveKey
+		reading reserveReading
+		held    bool
+	}
+	var transitions []transition
+	accounts := make(map[string]reserveAccount, len(logins))
+	for _, login := range logins {
+		accounts[login.id] = reserveAccount{}
+	}
+	unknown := make(map[string]bool)
+	b.mu.Lock()
+	for index, window := range reserveWindows {
+		var keys []reserveKey
+		var readings []reserveReading
+		var entries []reservePoolEntry
+		for i := range logins {
+			login := &logins[i]
+			key := reserveKey{authID: login.id, window: window}
+			reading, ok := b.mergeLocked(key, login.readings[index], login.ok[index])
+			if !ok && !login.atLimit {
+				if _, held := b.holds[key]; held {
+					delete(b.holds, key)
+					b.dirty = true
+				}
+				continue
+			}
+			entry := reservePoolEntry{id: login.id, headroom: math.Max(0, 1-reading.utilization), resetAt: reading.resetAt}
+			if !entry.resetAt.IsZero() && !entry.resetAt.After(now) {
+				entry.headroom, entry.resetAt = 1, time.Time{}
+			}
+			if login.atLimit {
+				entry.headroom = 0
+			}
+			keys, readings, entries = append(keys, key), append(readings, reading), append(entries, entry)
+		}
+		for i, next := range gate.poolHolds(entries, now) {
+			key := keys[i]
+			prev := b.holds[key]
+			if next.held {
+				if b.holds == nil {
+					b.holds = make(map[reserveKey]reserveHold)
+				}
+				b.holds[key] = next
+			} else {
+				delete(b.holds, key)
+			}
+			if next.held != prev.held || !next.until.Equal(prev.until) {
+				b.dirty = true
+			}
+			if next.held != prev.held {
+				transitions = append(transitions, transition{key: key, reading: readings[i], held: next.held})
+			}
+			if !next.held {
+				continue
+			}
+			account := accounts[key.authID]
+			account.held = true
+			if next.until.IsZero() {
+				unknown[key.authID] = true
+			} else if next.until.After(account.until) {
+				account.until = next.until
+			}
+			accounts[key.authID] = account
+		}
+	}
+	persist := b.dirty && b.path != ""
+	b.dirty = b.dirty && !persist
+	b.mu.Unlock()
+	for id := range unknown {
+		account := accounts[id]
+		account.until = time.Time{}
+		accounts[id] = account
+	}
+	for _, change := range transitions {
 		state := "released"
-		if next.held {
+		if change.held {
 			state = "held"
 		}
-		log.Infof("reserve gate: %s %s window %s (utilization %.2f, resets %s); non-exempt callers are refused only while every Max login is held", authID, window, state, reading.utilization, formatReserveReset(reading.resetAt))
+		log.Infof("reserve gate: %s %s window %s (utilization %.2f, resets %s); all its headroom is shared reserve, and non-exempt callers are refused only while every Max login is held", change.key.authID, change.key.window, state, change.reading.utilization, formatReserveReset(change.reading.resetAt))
 	}
 	if persist {
 		b.save(now)
 	}
-	return next
+	return accounts
 }
 
 // recordReserveReadings merges the readings of a response into the book as soon as the
@@ -233,13 +366,12 @@ func (m *Manager) recordReserveReadings(auth *Auth) {
 	if gate == nil || auth == nil || !isClaudeAuth(auth) {
 		return
 	}
-	now := time.Now()
 	for _, window := range reserveWindows {
 		if reading, ok := latestReserveReading(auth, window); ok {
-			m.reserveHolds.update(auth.ID, window, reading, ok, gate, now)
+			m.reserveHolds.merge(auth.ID, window, reading)
 		}
 	}
-	m.observeReserveTrigger(gate, now)
+	m.observeReserveTrigger(gate, time.Now())
 }
 
 // reserveLogin is one Max login (a Claude subscription login that is not disabled) as
@@ -263,8 +395,10 @@ type reserveAccount struct {
 
 // reserveCheck applies the gate to one request of a caller that is not exempt.
 //
-// The reserve is shared: a held Max login is kept from the caller only while every Max
-// login is held or at a real limit. The Max logins are captured by reserveCheckFor and
+// The reserve is shared: one amount for all Max logins, placed on the logins that reset
+// last (poolHolds). A login is held when all its headroom is reserve, and a held Max
+// login is kept from the caller only while every Max login is held or at a real limit,
+// that is while the logins together have no more than the reserve left. The Max logins are captured by reserveCheckFor and
 // evaluated against the book once, on first use, so every candidate of the request is
 // judged by the same view.
 type reserveCheck struct {
@@ -339,13 +473,20 @@ func (m *Manager) reserveMaxLogins(now time.Time) []reserveLogin {
 		if !isReserveMaxLogin(auth) {
 			continue
 		}
-		login := reserveLogin{id: auth.ID, atLimit: reserveAtRealLimit(auth, now)}
-		for index, window := range reserveWindows {
-			login.readings[index], login.ok[index] = latestReserveReading(auth, window)
-		}
+		login := reserveLoginOf(auth)
+		login.atLimit = reserveAtRealLimit(auth, now)
 		logins = append(logins, login)
 	}
 	return logins
+}
+
+// reserveLoginOf returns auth with its live readings, not marked at a real limit.
+func reserveLoginOf(auth *Auth) reserveLogin {
+	login := reserveLogin{id: auth.ID}
+	for index, window := range reserveWindows {
+		login.readings[index], login.ok[index] = latestReserveReading(auth, window)
+	}
+	return login
 }
 
 // isReserveMaxLogin reports whether auth is a Max login for the shared reserve: a Claude
@@ -368,19 +509,14 @@ func isClaudeAuth(auth *Auth) bool {
 	return canonicalSchedulingProvider(executorKeyFromAuth(auth)) == "claude"
 }
 
-// evaluate decides, once per check, the hold of every captured Max login and whether
-// any of them still has room. It takes only the book's lock.
+// evaluate decides, once per check, the hold of every captured Max login from the
+// shared reserve and whether any of them still has room. It takes only the book's lock.
 func (c *reserveCheck) evaluate() {
 	c.once.Do(func() {
-		c.accounts = make(map[string]reserveAccount, len(c.logins))
+		c.accounts = c.book.evaluate(c.gate, c.now, c.logins)
 		room := false
-		for index := range c.logins {
-			login := &c.logins[index]
-			account := c.holdOf(login.id, func(window int) (reserveReading, bool) {
-				return login.readings[window], login.ok[window]
-			})
-			c.accounts[login.id] = account
-			if !account.held && !login.atLimit {
+		for _, login := range c.logins {
+			if !c.accounts[login.id].held {
 				room = true
 			}
 		}
@@ -389,39 +525,14 @@ func (c *reserveCheck) evaluate() {
 	})
 }
 
-// holdOf evaluates every window of one account against the book.
-func (c *reserveCheck) holdOf(authID string, live func(window int) (reserveReading, bool)) reserveAccount {
-	var account reserveAccount
-	unknown := false
-	for index, window := range reserveWindows {
-		reading, ok := live(index)
-		state := c.book.update(authID, window, reading, ok, c.gate, c.now)
-		if !state.held {
-			continue
-		}
-		account.held = true
-		if state.until.IsZero() {
-			unknown = true
-		} else if state.until.After(account.until) {
-			account.until = state.until
-		}
-	}
-	if unknown {
-		account.until = time.Time{}
-	}
-	return account
-}
-
-// accountHold returns the evaluated hold of auth: the captured one, or, for a login the
-// capture did not see, one evaluated from auth itself.
+// accountHold returns the evaluated hold of auth: the captured one, or, for a credential
+// the capture did not see, its own reserve as a pool of one.
 func (c *reserveCheck) accountHold(auth *Auth) reserveAccount {
 	c.evaluate()
 	if account, ok := c.accounts[auth.ID]; ok {
 		return account
 	}
-	return c.holdOf(auth.ID, func(window int) (reserveReading, bool) {
-		return latestReserveReading(auth, reserveWindows[window])
-	})
+	return c.book.evaluate(c.gate, c.now, []reserveLogin{reserveLoginOf(auth)})[auth.ID]
 }
 
 // blocks reports whether the gate keeps auth from this request: every Claude credential
@@ -453,8 +564,8 @@ func (c *reserveCheck) blocks(auth *Auth) bool {
 }
 
 // blocksHomeDispatch is blocks for a Home pick. Home owns the credential list, so the
-// manager cannot see whether another Max login has room; the gate passes over a held
-// login Home picked and asks Home again, so the caller is refused only once Home has no
+// manager cannot see the other Max logins: each login Home picks keeps its own reserve
+// as a pool of one, and the gate passes over a held login Home picked and asks Home again, so the caller is refused only once Home has no
 // unheld Max login left. Home does not apply the fallback-when rule, so a credit key
 // stays blocked there.
 func (c *reserveCheck) blocksHomeDispatch(auth *Auth) bool {
@@ -464,9 +575,7 @@ func (c *reserveCheck) blocksHomeDispatch(auth *Auth) bool {
 	if c.gate.hold || authFallbackWhen(auth) != "" {
 		return true
 	}
-	return c.holdOf(auth.ID, func(window int) (reserveReading, bool) {
-		return latestReserveReading(auth, reserveWindows[window])
-	}).held
+	return c.book.evaluate(c.gate, c.now, []reserveLogin{reserveLoginOf(auth)})[auth.ID].held
 }
 
 // holdError builds the error for a request whose every candidate the gate removed.

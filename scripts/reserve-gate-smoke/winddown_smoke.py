@@ -356,7 +356,7 @@ def both_held_wind_down_restart(binary, run, upstream, ca, minutes=1):
     (f) restart: holds come back from the state file, the wind-down clock restarts."""
     now = int(time.time())
     started = time.time()
-    f = Fixture(binary, run, upstream, ca, seed={"maxa": (0.97, now + 2 * DAY), "maxb": (0.96, now + 3 * DAY)},
+    f = Fixture(binary, run, upstream, ca, seed={"maxa": (0.98, now + 2 * DAY), "maxb": (0.99, now + 3 * DAY)},
                 wind_down=minutes)
     try:
         f.check("(a) both held: new prompt 429 reserve hold, no upstream call", NEW_PROMPT, 429, [], reserve=True)
@@ -441,7 +441,7 @@ def drained_key(binary, run, upstream, ca):
     held: it is not a Max login with room, so a new prompt is still refused; a running task is
     served by it (first in priority) with the note."""
     now = int(time.time())
-    f = Fixture(binary, run, upstream, ca, seed={"maxa": (0.97, now + 2 * DAY), "maxb": (0.96, now + 3 * DAY)},
+    f = Fixture(binary, run, upstream, ca, seed={"maxa": (0.98, now + 2 * DAY), "maxb": (0.99, now + 3 * DAY)},
                 drained=True)
     try:
         f.check("(d) drained key + both held: new prompt 429 reserve hold, no upstream call", NEW_PROMPT, 429, [],
@@ -473,37 +473,47 @@ def trigger_off(binary, run, upstream, ca):
 
 
 def near_reset_limits(binary, run, upstream, ca):
-    """(g) per-login limit by its own reset: 95% while more than 6 h remain, 99% from 6 h to
-    1 h, 100% in the final hour. maxa resets in 30 h, maxb in 5 h, then in 50 minutes."""
+    """(g) one shared reserve: 5% while the next reset of any login is more than 6 h away, 1%
+    from 6 h to 1 h, nothing in the final hour, placed on the login that resets last."""
     now = int(time.time())
-    f = Fixture(binary, run / "near-97", upstream, ca, seed={"maxa": (0.97, now + 30 * HOUR), "maxb": (0.97, now + 5 * HOUR)})
+    f = Fixture(binary, run / "pool-room", upstream, ca, seed={"maxa": (0.98, now + 9 * HOUR), "maxb": (0.96, now + 26 * HOUR)})
     try:
-        f.check("(g) maxb at 97% with 5 h left is under its 99% limit: new prompt 200 by a Max login", NEW_PROMPT, 200, {"credit"})
+        f.check("(g) maxa 98% (9 h), maxb 96% (26 h): 6% left is above the 5% reserve, new prompt 200", NEW_PROMPT, 200,
+                {"credit"})
     finally:
         f.stop()
-    f = Fixture(binary, run / "near-99", upstream, ca, seed={"maxa": (0.97, now + 30 * HOUR), "maxb": (0.99, now + 5 * HOUR)})
+    f = Fixture(binary, run / "pool-held", upstream, ca, seed={"maxa": (0.99, now + 9 * HOUR), "maxb": (0.96, now + 26 * HOUR)})
     try:
-        _, _, headers = f.check("(g) maxb at 99% with 5 h left is held, maxa held: new prompt 429", NEW_PROMPT, 429, [],
+        _, _, headers = f.check("(g) maxa 99%, maxb 96%: 5% left is the reserve, new prompt 429", NEW_PROMPT, 429, [],
+                                reserve=True)
+        retry = int(headers.get("Retry-After", "0"))
+        if abs(retry - 3 * HOUR) > 120:
+            raise AssertionError(f"Retry-After {retry}, want about {3 * HOUR} (6 h before maxa's reset)")
+        print(f"PASS (g) Retry-After {retry} names the 1% step, 6 h before maxa's reset", flush=True)
+        f.check("(g) pool at the reserve: exempt 200 by a Max login", NEW_PROMPT, 200, {"credit"}, automation=True)
+    finally:
+        f.stop()
+    f = Fixture(binary, run / "near-held", upstream, ca, seed={"maxa": (1.0, now + 30 * HOUR), "maxb": (0.99, now + 5 * HOUR)})
+    try:
+        _, _, headers = f.check("(g) maxb's reset in 5 h: 1% left is the 1% reserve, new prompt 429", NEW_PROMPT, 429, [],
                                 reserve=True)
         retry = int(headers.get("Retry-After", "0"))
         if abs(retry - 4 * HOUR) > 120:
             raise AssertionError(f"Retry-After {retry}, want about {4 * HOUR} (maxb's final hour)")
         print(f"PASS (g) Retry-After {retry} names maxb's final hour, 4 h from now", flush=True)
-        f.check("(g) both held: exempt 200 by a Max login", NEW_PROMPT, 200, {"credit"}, automation=True)
     finally:
         f.stop()
-    f = Fixture(binary, run / "final-hour", upstream, ca, seed={"maxa": (0.97, now + 30 * HOUR), "maxb": (0.99, now + 50 * 60)})
+    f = Fixture(binary, run / "final-hour", upstream, ca, seed={"maxa": (1.0, now + 30 * HOUR), "maxb": (0.99, now + 50 * 60)})
     try:
-        f.check("(g) maxb at 99% with 50 minutes left (limit 100%): new prompt 200 by a Max login", NEW_PROMPT, 200, {"credit"})
+        f.check("(g) maxb's reset in 50 minutes: no reserve, new prompt 200 by a Max login", NEW_PROMPT, 200, {"credit"})
     finally:
         f.stop()
     lines = "    near-reset-hours: 12\n    near-reset-threshold: 0.98\n    final-release-hours: 2\n"
     f = Fixture(binary, run / "explicit-keys", upstream, ca, gate_lines=lines,
-                seed={"maxa": (0.97, now + 30 * HOUR), "maxb": (0.97, now + 10 * HOUR)})
+                seed={"maxa": (0.99, now + 30 * HOUR), "maxb": (0.98, now + 10 * HOUR)})
     try:
-        # With the defaults maxb would be held (95%, more than 6 h left); with a 12 h window at 98% it has room.
-        f.check("(g) explicit keys: maxb at 97% with 10 h left is under its 98% limit: new prompt 200", NEW_PROMPT, 200,
-                {"credit"})
+        # With the defaults the 5% reserve would hold both; with a 12 h window at 98% the reserve is 2%.
+        f.check("(g) explicit keys: 3% left, next reset in 10 h, reserve 2%: new prompt 200", NEW_PROMPT, 200, {"credit"})
     finally:
         f.stop()
 

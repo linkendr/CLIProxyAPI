@@ -19,21 +19,22 @@ const (
 	// DefaultReserveGateWindDownMinutes is how long, after every Max login first
 	// became held, a running task of a caller that is not exempt may still finish.
 	DefaultReserveGateWindDownMinutes = 15
-	// DefaultReserveGateNearResetHours is how long before a Max login's weekly reset its
-	// limit rises to DefaultReserveGateNearResetThreshold.
+	// DefaultReserveGateNearResetHours is how long before the next weekly reset of any Max
+	// login the shared reserve shrinks to 1 - DefaultReserveGateNearResetThreshold.
 	DefaultReserveGateNearResetHours = 6
-	// DefaultReserveGateNearResetThreshold is the limit of a Max login near its reset.
+	// DefaultReserveGateNearResetThreshold sets the shared reserve near the next reset.
 	DefaultReserveGateNearResetThreshold = 0.99
-	// DefaultReserveGateFinalReleaseHours is how long before a Max login's weekly reset
-	// its limit is 1: nothing is kept, every caller may use what is left.
+	// DefaultReserveGateFinalReleaseHours is how long before the next weekly reset of any
+	// Max login no reserve is kept: every caller may use what is left.
 	DefaultReserveGateFinalReleaseHours = 1
 )
 
 // ReserveGateConfig keeps the last part of the Claude Max logins' 7-day usage for
-// exempt callers (automations). A Max login is held while its latest 7d utilization is
-// at or above its limit, which steps up as the login's own weekly reset comes near:
-// Threshold while more than NearResetHours remain, NearResetThreshold from then on, and
-// 1 in the final FinalReleaseHours. A login with no known reset keeps Threshold. The reserve is shared: callers that
+// exempt callers (automations). The Max logins keep one shared reserve, 1 - a limit that
+// steps up as the next weekly reset of any Max login comes near: Threshold while more
+// than NearResetHours remain, NearResetThreshold from then on, and 1 in the final
+// FinalReleaseHours; Threshold when no reset is known. The reserve sits on the logins
+// that reset last, and a login is held when all its headroom is reserve. Callers that
 // are not exempt are kept off held logins only while every Max login is held (or at a
 // real upstream limit); while one still has room, they may use any of them. Paid credit
 // keys (fallback-when) serve those callers only under their own fallback-when rule, and
@@ -46,8 +47,8 @@ type ReserveGateConfig struct {
 	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	// Hold pauses every Claude credential for callers that are not exempt.
 	Hold bool `yaml:"hold,omitempty" json:"hold,omitempty"`
-	// Threshold is the 7d utilization (0-1) at or above which a Max login is held.
-	// Zero means DefaultReserveGateThreshold.
+	// Threshold (0-1) sets the shared reserve, 1 - Threshold of one login's 7d quota,
+	// while the next reset is far. Zero means DefaultReserveGateThreshold.
 	Threshold float64 `yaml:"threshold,omitempty" json:"threshold,omitempty"`
 	// ExemptAPIKeys lists the client keys (access api-keys) the gate never applies to.
 	ExemptAPIKeys []string `yaml:"exempt-api-keys,omitempty" json:"exempt-api-keys,omitempty"`
@@ -58,14 +59,15 @@ type ReserveGateConfig struct {
 	// task of a caller that is not exempt is still served. Unset means
 	// DefaultReserveGateWindDownMinutes; 0 refuses running tasks at once.
 	WindDownMinutes *int `yaml:"wind-down-minutes,omitempty" json:"wind-down-minutes,omitempty"`
-	// NearResetHours is how long before a login's weekly reset its limit rises to
-	// NearResetThreshold. Unset means DefaultReserveGateNearResetHours; 0 turns it off.
+	// NearResetHours is how long before the next weekly reset of any Max login the
+	// reserve is 1 - NearResetThreshold. Unset means DefaultReserveGateNearResetHours; 0
+	// turns it off.
 	NearResetHours *int `yaml:"near-reset-hours,omitempty" json:"near-reset-hours,omitempty"`
-	// NearResetThreshold is the limit (0-1) near the reset; a Threshold above it wins.
+	// NearResetThreshold (0-1) sets the reserve near the reset; a Threshold above it wins.
 	// Zero means DefaultReserveGateNearResetThreshold.
 	NearResetThreshold float64 `yaml:"near-reset-threshold,omitempty" json:"near-reset-threshold,omitempty"`
-	// FinalReleaseHours is how long before a login's weekly reset its limit is 1. Unset
-	// means DefaultReserveGateFinalReleaseHours; 0 turns it off.
+	// FinalReleaseHours is how long before the next weekly reset of any Max login no
+	// reserve is kept. Unset means DefaultReserveGateFinalReleaseHours; 0 turns it off.
 	FinalReleaseHours *int `yaml:"final-release-hours,omitempty" json:"final-release-hours,omitempty"`
 }
 
