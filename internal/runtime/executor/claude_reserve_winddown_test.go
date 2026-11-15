@@ -7,11 +7,11 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	"github.com/tidwall/gjson"
 )
 
 func TestAppendClaudeReserveWindDownNote(t *testing.T) {
@@ -55,7 +55,7 @@ func TestAppendClaudeReserveWindDownNoteKeepsPrefix(t *testing.T) {
 	if len(got) < len(prefix) || got[:len(prefix)] != prefix {
 		t.Fatalf("prefix changed: %s", got)
 	}
-	if gjson.Get(got, "system.#").Int() != 1 {
+	if ojson.Get(got, "system.#").Int() != 1 {
 		t.Fatalf("system prompt changed: %s", got)
 	}
 }
@@ -66,7 +66,7 @@ func claudeWindDownUpstream(t *testing.T, auth *cliproxyauth.Auth, format sdktra
 	var seen []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen, _ = io.ReadAll(r.Body)
-		if gjson.GetBytes(seen, "stream").Bool() {
+		if ojson.GetBytes(seen, "stream").Bool() {
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-6\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"+
 				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n"+
@@ -94,9 +94,9 @@ func claudeWindDownUpstream(t *testing.T, auth *cliproxyauth.Auth, format sdktra
 	return seen
 }
 
-func lastUserBlocks(t *testing.T, body []byte) []gjson.Result {
+func lastUserBlocks(t *testing.T, body []byte) []ojson.Result {
 	t.Helper()
-	messages := gjson.GetBytes(body, "messages").Array()
+	messages := ojson.GetBytes(body, "messages").Array()
 	if len(messages) == 0 {
 		t.Fatalf("upstream body has no messages: %s", body)
 	}
@@ -133,7 +133,7 @@ func TestClaudeExecutorAppendsReserveWindDownNote(t *testing.T) {
 			if end.Get("type").String() != "text" || end.Get("text").String() != cliproxyauth.ReserveWindDownNote {
 				t.Fatalf("%s stream=%v: last block %s, want the wind-down note", tc.name, stream, end.Raw)
 			}
-			for _, system := range gjson.GetBytes(body, "system").Array() {
+			for _, system := range ojson.GetBytes(body, "system").Array() {
 				if system.Get("text").String() == cliproxyauth.ReserveWindDownNote {
 					t.Fatalf("%s stream=%v: note found in the system prompt", tc.name, stream)
 				}

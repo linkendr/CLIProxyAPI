@@ -3,9 +3,8 @@ package executor
 import (
 	"strconv"
 
+	"github.com/MoeForge/moego/ojson"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // applyClaudeReserveWindDownNote appends the reserve gate's wrap-up note to the last user
@@ -24,7 +23,7 @@ func applyClaudeReserveWindDownNote(auth *cliproxyauth.Auth, metadata map[string
 // Claude Messages body when that message is a user message. Any other body is returned
 // unchanged.
 func appendClaudeReserveWindDownNote(body []byte, note string) []byte {
-	messages := gjson.GetBytes(body, "messages")
+	messages := ojson.GetBytes(body, "messages")
 	if !messages.IsArray() {
 		return body
 	}
@@ -33,7 +32,7 @@ func appendClaudeReserveWindDownNote(body []byte, note string) []byte {
 		return body
 	}
 	path := "messages." + strconv.Itoa(count-1)
-	last := gjson.GetBytes(body, path)
+	last := ojson.GetBytes(body, path)
 	if last.Get("role").String() != "user" {
 		return body
 	}
@@ -45,13 +44,13 @@ func appendClaudeReserveWindDownNote(body []byte, note string) []byte {
 	)
 	switch {
 	case content.IsArray():
-		updated, err = sjson.SetBytes(body, path+".content.-1", block)
-	case content.Type == gjson.String:
+		updated, err = ojson.SetBytes(body, path+".content.-1", block)
+	case content.Type == ojson.String:
 		blocks := []map[string]string{block}
 		if content.String() != "" {
 			blocks = []map[string]string{{"type": "text", "text": content.String()}, block}
 		}
-		updated, err = sjson.SetBytes(body, path+".content", blocks)
+		updated, err = ojson.SetBytes(body, path+".content", blocks)
 	default:
 		return body
 	}

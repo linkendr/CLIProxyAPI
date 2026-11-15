@@ -750,3 +750,28 @@ func TestReserveGateOnSchedulerFastPathWithoutCreditKey(t *testing.T) {
 		})
 	}
 }
+
+// A pinned request accounts against the same eligible pool an unpinned request sees,
+// so a login the reserve gate blocks must not enter the weighted accounting pool. With
+// the shared reserve the gate blocks a Max login only while every Max login is held, so
+// the pinned credential that still serves is one of another provider on a mixed route.
+func TestReserveGateExcludesHeldPeerFromPinnedAccounting(t *testing.T) {
+	weighted := &WeightedRoundRobinSelector{}
+	rig := newReserveRig(t, weighted, true, reserveGateOn(nil))
+	rig.disable(t, rig.credit)
+	registry.GetGlobalRegistry().RegisterClient(rig.codex, "codex", []*registry.ModelInfo{{ID: reserveTestGPTModel}, {ID: reserveTestClaudeModel}})
+	rig.observe(t, rig.a, "7d", 0.99, time.Now().Add(25*time.Hour))
+	rig.observe(t, rig.b, "7d", 0.99, time.Now().Add(24*time.Hour))
+	opts := reserveOpts(reserveTestUserKey, "")
+	opts.Metadata[cliproxyexecutor.PinnedAuthMetadataKey] = rig.codex
+	picked, _, _, err := rig.manager.pickNextMixedLegacy(context.Background(), []string{"claude", "codex"}, reserveTestClaudeModel, opts, nil)
+	if err != nil || picked == nil || picked.ID != rig.codex {
+		t.Fatalf("pinned pick = %v, %v, want %s", picked, err, rig.codex)
+	}
+	route := "mixed:" + reserveTestClaudeModel
+	weightedStateForTest(t, weighted, route, rig.codex)
+	held := map[string]int64{rig.a: 1, rig.b: 1, rig.codex: 1}
+	if weighted.states[weightedPoolStateKey(route, held)] != nil {
+		t.Fatalf("pinned accounting pool included the reserve-held %s and %s", rig.a, rig.b)
+	}
+}

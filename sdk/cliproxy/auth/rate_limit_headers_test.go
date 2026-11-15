@@ -53,7 +53,8 @@ func TestModelCooldownHeadersSynthesizeUnifiedReset(t *testing.T) {
 	err := newModelCooldownError("claude-haiku-5-5", "claude", 90*time.Minute)
 	after := time.Now()
 
-	headers := SafeResponseHeaders(err)
+	// The handler reads Headers(); upstream moved the Claude unified headers there.
+	headers := err.Headers()
 	if got := headers.Get("anthropic-ratelimit-unified-status"); got != "rejected" {
 		t.Fatalf("unified-status = %q, want rejected", got)
 	}

@@ -11,13 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	_ "github.com/router-for-me/CLIProxyAPI/v8/internal/translator"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	"github.com/tidwall/gjson"
 )
 
 const (
@@ -46,12 +46,12 @@ func codexTestAuth(baseURL string) *cliproxyauth.Auth {
 
 func codexTestRequest() (cliproxyexecutor.Request, cliproxyexecutor.Options) {
 	return cliproxyexecutor.Request{
-			Model:   "gpt-5.6-terra",
-			Payload: []byte(`{"model":"gpt-5.6-terra","input":"hello"}`),
-		}, cliproxyexecutor.Options{
-			SourceFormat: sdktranslator.FromString("openai-response"),
-			Stream:       true,
-		}
+		Model:   "gpt-5.6-terra",
+		Payload: []byte(`{"model":"gpt-5.6-terra","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       true,
+	}
 }
 
 // codexSSEServer streams the supplied event payloads as an HTTP 200 SSE response.
@@ -92,11 +92,11 @@ func codexWebsocketServer(t *testing.T, frames ...string) *httptest.Server {
 
 func codexWebsocketRequest() (cliproxyexecutor.Request, cliproxyexecutor.Options) {
 	return cliproxyexecutor.Request{
-			Model:   "gpt-5.6-terra",
-			Payload: []byte(`{"model":"gpt-5.6-terra","input":[{"type":"message","role":"user","content":"hello"}]}`),
-		}, cliproxyexecutor.Options{
-			SourceFormat: sdktranslator.FromString("openai-response"),
-		}
+		Model:   "gpt-5.6-terra",
+		Payload: []byte(`{"model":"gpt-5.6-terra","input":[{"type":"message","role":"user","content":"hello"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+	}
 }
 
 // drainChunks collects every payload and the first error from a stream result.
@@ -922,7 +922,7 @@ func TestIsCodexBootstrapBufferableEvent(t *testing.T) {
 		`   `,
 	}
 	for _, payload := range hold {
-		eventType := gjson.GetBytes([]byte(payload), "type").String()
+		eventType := ojson.GetBytes([]byte(payload), "type").String()
 		if !isCodexBootstrapBufferableEvent(eventType, []byte(payload)) {
 			t.Errorf("must stay bufferable: %s", payload)
 		}
@@ -958,7 +958,7 @@ func TestIsCodexBootstrapBufferableEvent(t *testing.T) {
 		`{"type":"response.some_future_event_we_have_never_seen"}`,
 	}
 	for _, payload := range release {
-		eventType := gjson.GetBytes([]byte(payload), "type").String()
+		eventType := ojson.GetBytes([]byte(payload), "type").String()
 		if isCodexBootstrapBufferableEvent(eventType, []byte(payload)) {
 			t.Errorf("must release the stream: %s", payload)
 		}

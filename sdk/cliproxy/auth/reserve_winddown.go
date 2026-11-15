@@ -5,9 +5,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 // ReserveWindDownMetadataKey marks, in Options.Metadata, a request of a caller that is
@@ -40,12 +40,12 @@ func ReserveWindDownNoteApplies(auth *Auth, meta map[string]any) bool {
 //   - OpenAI Responses: the last input item is a *_call_output item.
 //   - Gemini: the last content has a functionResponse part.
 func reserveRequestIsRunningTask(format sdktranslator.Format, payload []byte) bool {
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 || !ojson.ValidBytes(payload) {
 		return false
 	}
 	switch format {
 	case sdktranslator.FormatClaude:
-		last := lastArrayItem(gjson.GetBytes(payload, "messages"))
+		last := lastArrayItem(ojson.GetBytes(payload, "messages"))
 		if !last.Exists() || !strings.EqualFold(last.Get("role").String(), "user") {
 			return false
 		}
@@ -54,19 +54,19 @@ func reserveRequestIsRunningTask(format sdktranslator.Format, payload []byte) bo
 			return false
 		}
 		found := false
-		content.ForEach(func(_, block gjson.Result) bool {
+		content.ForEach(func(_, block ojson.Result) bool {
 			found = block.Get("type").String() == "tool_result"
 			return !found
 		})
 		return found
 	case sdktranslator.FormatOpenAI:
-		role := strings.ToLower(lastArrayItem(gjson.GetBytes(payload, "messages")).Get("role").String())
+		role := strings.ToLower(lastArrayItem(ojson.GetBytes(payload, "messages")).Get("role").String())
 		return role == "tool" || role == "function"
 	case sdktranslator.FormatOpenAIResponse:
-		return strings.HasSuffix(lastArrayItem(gjson.GetBytes(payload, "input")).Get("type").String(), "_call_output")
+		return strings.HasSuffix(lastArrayItem(ojson.GetBytes(payload, "input")).Get("type").String(), "_call_output")
 	case sdktranslator.FormatGemini:
 		found := false
-		lastArrayItem(gjson.GetBytes(payload, "contents")).Get("parts").ForEach(func(_, part gjson.Result) bool {
+		lastArrayItem(ojson.GetBytes(payload, "contents")).Get("parts").ForEach(func(_, part ojson.Result) bool {
 			found = part.Get("functionResponse").Exists()
 			return !found
 		})
@@ -76,13 +76,13 @@ func reserveRequestIsRunningTask(format sdktranslator.Format, payload []byte) bo
 	}
 }
 
-func lastArrayItem(array gjson.Result) gjson.Result {
+func lastArrayItem(array ojson.Result) ojson.Result {
 	if !array.IsArray() {
-		return gjson.Result{}
+		return ojson.Result{}
 	}
 	items := array.Array()
 	if len(items) == 0 {
-		return gjson.Result{}
+		return ojson.Result{}
 	}
 	return items[len(items)-1]
 }

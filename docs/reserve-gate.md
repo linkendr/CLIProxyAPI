@@ -118,7 +118,7 @@ A 429 that the proxy itself sends for a Claude limit names the limit and the res
 - After the sentence comes ` (reset after 119h 59m 30s)`, the time left. T3 Code reads the reset time from this text (see below).
 - When every Max login is at a real limit, an ordinary caller's refusal names that real limit, not the reserve: the reserve is then not what refuses the caller. The error stays a reserve hold inside the proxy, so nothing is retried.
 - The manual `hold` keeps its text and has no reset.
-- Headers: `Retry-After` (seconds), `anthropic-ratelimit-unified-status: rejected`, `anthropic-ratelimit-unified-reset` (Unix seconds) and `anthropic-ratelimit-unified-representative-claim` (`seven_day` for the weekly limit and the reserve, `seven_day_overage_included` for a model-scoped limit, `five_hour`; absent when the limit is not known). Refusal headers reach the client whatever `passthrough-headers` says.
+- Headers: `Retry-After` (seconds), `anthropic-ratelimit-unified-status: rejected`, `anthropic-ratelimit-unified-reset` (Unix seconds) and `anthropic-ratelimit-unified-representative-claim` (`seven_day` for the weekly limit and the reserve, `seven_day_overage_included` for a model-scoped limit, `five_hour`; absent when the limit is not known). Refusal headers reach the client whatever `passthrough-headers` says. A cooldown refusal with no cooled Max login behind it follows upstream: `Retry-After` always, the unified headers only with `passthrough-headers: true`.
 
 What the clients do with this was checked against Claude Code 2.1.312, the client T3 Code 0.1.9 runs (proof: `HEADERS-PROOF.md` in the task's evidence folder):
 
