@@ -242,6 +242,11 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	}
 	stripDefaultKimiClaudeCodeAttributionDoc(auth, url, fp.ProfileClaudeCodeCLI, doc)
 	applyClaudePreservedThinkingBindingDoc(doc)
+	// The reserve gate's wrap-up note is the last built-in injection, so no later rewrite
+	// moves it off the end of the last user message; the user rules below still win.
+	if errNote := helps.ApplyClaudeReserveWindDownNoteDoc(doc, auth, opts.Metadata); errNote != nil {
+		return nil, fmt.Errorf("append reserve wind-down note: %w", errNote)
+	}
 	// User rules match the fully prepared business body and are applied only once.
 	touchedPayloadPaths := helps.ApplyPayloadConfigWithTrackedPathsDoc(
 		e.cfg, baseModel, to.String(), from.String(), "", doc, stripTranslatedDefaultMaxTokens(from, originalPayload, originalTranslated),

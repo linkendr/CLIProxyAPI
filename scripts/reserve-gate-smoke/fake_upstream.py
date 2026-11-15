@@ -1,7 +1,7 @@
 """Fake upstream for the reserve-gate smoke test. Loopback only, no credentials.
 
 POST /v1/messages        Anthropic Messages reply with unified rate-limit headers
-                         (5h utilization from argv[2]).
+                         (7d utilization from argv[2]; no 5h window, as Anthropic now).
 POST /codex/responses    Codex-style Responses SSE stream ending in response.completed.
 Every hit is appended to argv[3] as "<path> <x-api-key or bearer suffix>".
 """
@@ -52,10 +52,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.send_header("anthropic-ratelimit-unified-status", "allowed")
-        self.send_header("anthropic-ratelimit-unified-5h-utilization", UTIL)
-        self.send_header("anthropic-ratelimit-unified-5h-reset", str(now + 3600))
-        self.send_header("anthropic-ratelimit-unified-5h-status", "allowed")
-        self.send_header("anthropic-ratelimit-unified-7d-utilization", "0.10")
+        self.send_header("anthropic-ratelimit-unified-7d-utilization", UTIL)
         self.send_header("anthropic-ratelimit-unified-7d-reset", str(now + 5 * 86400))
         self.send_header("anthropic-ratelimit-unified-7d-status", "allowed")
         self.send_header("content-length", str(len(body)))

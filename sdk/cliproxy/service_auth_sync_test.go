@@ -1079,15 +1079,19 @@ func TestHandleAuthUpdates_SameRevisionWaitDoesNotWaitForOtherAuthInBatch(t *tes
 		t.Fatal("second auth registration in batch did not start")
 	}
 
-	doneA := make(chan struct{})
-	go func() {
-		service.handleAuthUpdate(context.Background(), updateA)
-		close(doneA)
-	}()
+	// The workers start the two registrations in either order and the hook blocks the
+	// second one, so the wait of the other auth is the one that must return.
+	doneFree := make(chan struct{}, 2)
+	for _, update := range []watcher.AuthUpdate{updateA, updateB} {
+		go func() {
+			service.handleAuthUpdate(context.Background(), update)
+			doneFree <- struct{}{}
+		}()
+	}
 	select {
-	case <-doneA:
+	case <-doneFree:
 	case <-time.After(2 * time.Second):
-		t.Fatal("auth A hook wait blocked on unrelated auth B registration")
+		t.Fatal("auth hook wait blocked on the registration of the other auth in the batch")
 	}
 
 	close(bBlock)

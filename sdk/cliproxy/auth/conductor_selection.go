@@ -2346,7 +2346,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
-	reserve := m.reserveCheckFor(opts.Metadata)
+	reserve := m.reserveCheckFor(opts)
 	var reserveGated []*Auth
 	pluginScheduler, schedulerAcross := m.snapshotPluginScheduler()
 
@@ -2435,6 +2435,13 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	)
 	if len(candidates) > 0 {
 		available, selectorAuths, errAvailable = m.availableAuthsForSelector(ctx, selector, candidates, provider, model, now, schedulerAcross, opts.Headers)
+		if errAvailable != nil && len(reserveGated) > 0 && onlyCreditCandidates(candidates) {
+			// The reserve gate removed every Max login and no credit key may serve yet: the
+			// caller gets the reserve hold, not the credit keys' unavailability.
+			errHold := reserve.holdError(reserveGated)
+			m.mu.RUnlock()
+			return nil, nil, errHold
+		}
 		if errAvailable != nil && !canInspectUnavailableAffinity {
 			m.mu.RUnlock()
 			m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errAvailable)
@@ -2719,7 +2726,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
 	// The scheduler does not know the reserve gate: a request it would affect takes the
 	// legacy path, which filters the candidates.
-	reserve := m.reserveCheckFor(opts.Metadata)
+	reserve := m.reserveCheckFor(opts)
 	targetKey := canonicalSchedulingProvider(provider)
 	if strings.TrimSpace(model) != "" || targetKey == "codex" || reserve != nil {
 		m.mu.RLock()
@@ -2846,7 +2853,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
-	reserve := m.reserveCheckFor(opts.Metadata)
+	reserve := m.reserveCheckFor(opts)
 	var reserveGated []*Auth
 
 	providerSet := make(map[string]struct{}, len(providers))
@@ -2951,6 +2958,11 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	)
 	if len(candidates) > 0 {
 		available, selectorAuths, errAvailable = m.availableAuthsForSelector(ctx, selector, candidates, "mixed", model, now, schedulerAcross, opts.Headers)
+		if errAvailable != nil && len(reserveGated) > 0 && onlyCreditCandidates(candidates) {
+			errHold := reserve.holdError(reserveGated)
+			m.mu.RUnlock()
+			return nil, nil, "", errHold
+		}
 		if errAvailable != nil && !canInspectUnavailableAffinity {
 			m.mu.RUnlock()
 			m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errAvailable)
@@ -3063,7 +3075,51 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	return authCopy, executor, providerKey, nil
 }
 
+// pickNextMixed selects the credential of one attempt. At a quota dead end, where no Max
+// login can serve the caller, it first reads the real usage of the Max logins
+// (refreshQuotaUsage) and selects once more if that lifted a cooldown or changed a
+// reading: a limit the owner reset upstream is then seen without a manual step. A
+// cooldown refusal behind a cooled Max login names the limit and its reset. Home owns
+// the credentials under Home dispatch, so nothing is read there.
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	auth, executor, provider, errPick := m.pickNextMixedOnce(ctx, providers, model, opts, tried)
+	if m.HomeEnabled() || !quotaDeadEnd(auth, providers, errPick) {
+		return auth, executor, provider, errPick
+	}
+	if m.refreshQuotaUsage(ctx) {
+		auth, executor, provider, errPick = m.pickNextMixedOnce(ctx, providers, model, opts, tried)
+	}
+	now := time.Now()
+	errPick = m.nameQuotaRefusal(errPick, model, now)
+	m.syncQuotaState(now)
+	return auth, executor, provider, errPick
+}
+
+// quotaDeadEnd reports whether a selection ended where no Max login can serve the
+// caller: a reserve hold refusal (not the manual hold, which no reading lifts), a
+// cooldown refusal on a route that includes Claude, or a Claude credit key
+// (fallback-when) about to serve.
+func quotaDeadEnd(selected *Auth, providers []string, errPick error) bool {
+	if errPick == nil {
+		return selected != nil && isClaudeAuth(selected) && authFallbackWhen(selected) != ""
+	}
+	var holdErr *reserveHoldError
+	if errors.As(errPick, &holdErr) && holdErr != nil {
+		return !holdErr.manual
+	}
+	var cooldownErr *modelCooldownError
+	if !errors.As(errPick, &cooldownErr) || cooldownErr == nil {
+		return false
+	}
+	for _, provider := range providers {
+		if canonicalSchedulingProvider(provider) == "claude" {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) pickNextMixedOnce(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	opts.EnsureMetadata()
 	clearSchedulerSelectionID(opts.Metadata)
 	if m.HomeEnabled() {
@@ -3098,7 +3154,7 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
 	// The scheduler does not know the reserve gate: a request it would affect takes the
 	// legacy path, which filters the candidates.
-	reserve := m.reserveCheckFor(opts.Metadata)
+	reserve := m.reserveCheckFor(opts)
 	providerSet := make(map[string]struct{}, len(eligibleProviders))
 	for _, providerKey := range eligibleProviders {
 		providerSet[providerKey] = struct{}{}

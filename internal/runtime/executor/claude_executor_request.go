@@ -892,6 +892,13 @@ func classifyClaudeUpstreamErrorWithCooling(statusCode int, headers http.Header,
 		retryAfter = helps.ParseClaudeRateLimitResetForError(headers, body, time.Now())
 	}
 	err := statusErr{code: statusCode, msg: string(body), retryAfter: retryAfter}
+	if statusCode == http.StatusBadRequest && claudeBodyIndicatesCreditBalanceTooLow(body) {
+		// An API key whose prepaid credit is spent. Another credential may still serve
+		// the request, so report it as a credential-wide 402: the key cools down, the
+		// request rotates, and the reserve gate sees the key as out of credit.
+		err.code = http.StatusPaymentRequired
+		return claudeCreditBalanceError{err}
+	}
 	if statusCode == http.StatusTooManyRequests {
 		err.rateLimitHeaders = cliproxyauth.FilterUpstreamRateLimitHeaders(headers)
 		if !modelLevelCooling && helps.ClaudeHeadersIndicateUnifiedRateLimitRejection(headers) {
@@ -904,6 +911,25 @@ func classifyClaudeUpstreamErrorWithCooling(statusCode int, headers http.Header,
 		return claudeRateLimitError{statusErr: err, credentialScoped: false}
 	}
 	return err
+}
+
+// claudeCreditBalanceError is Anthropic's refusal of an API key with no credit left.
+type claudeCreditBalanceError struct {
+	statusErr
+}
+
+func (e claudeCreditBalanceError) IsCredentialScoped() bool {
+	return true
+}
+
+func (e claudeCreditBalanceError) IsRequestScoped() bool {
+	return false
+}
+
+// claudeBodyIndicatesCreditBalanceTooLow matches Anthropic's 400 invalid_request_error
+// "Your credit balance is too low to access the Anthropic API".
+func claudeBodyIndicatesCreditBalanceTooLow(body []byte) bool {
+	return strings.Contains(strings.ToLower(string(body)), "credit balance is too low")
 }
 
 // claudeBodyIndicatesFastModeCredits matches Anthropic's fast-mode entitlement

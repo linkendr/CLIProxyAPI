@@ -6,14 +6,15 @@
 # loopback ports with a throwaway config, fake client keys and a fake loopback
 # upstream (no real credentials, never the real config, auth dir or port 8317),
 # and asserts through real HTTP:
-#   (a) after an upstream 5h reading of 0.97: non-exempt 429 with the reserve
-#       message and Retry-After; exempt 200
+#   (a) after an upstream 7d reading of 0.97 on the only Claude credential, a
+#       claude-api-key: it is not a Max login (only OAuth logins are), so there is
+#       no reserve and the non-exempt key is served (200); exempt 200. The held-login
+#       scenarios need OAuth logins and run in winddown_smoke.sh.
 #   (b) hot-reloaded hold: true: non-exempt 429 without Retry-After; exempt 200
 #   (d) while held, a Codex (GPT) route is unaffected for the non-exempt key
 #   (c) hot-reloaded enabled: false: both keys 200
-#   (e) restart with enabled: true: the 0.97 reading kept in the state file holds
-#       before any new upstream response (non-exempt 429 without reaching the
-#       upstream; exempt 200); the state file is mode 600 and holds no key
+#   (e) restart with enabled: true: the 0.97 reading is kept in the state file
+#       (mode 600, no key) and the API key is still not reserve-held (both 200)
 # Prints PASS/FAIL per assertion and exits non-zero on any failure.
 #
 # All writes (binary, Go build cache, config, logs, hits) go under
@@ -154,11 +155,10 @@ start_proxy "$RUN/proxy.log"
 claude a0 "$AUTO_KEY"   # exempt request records the upstream 0.97 reading
 [[ $STATUS == 200 ]] && pass "a0 exempt first request 200 (records 0.97 reading)" || fail "a0 exempt first request: $STATUS $(cat "$RUN/a0.body")"
 claude a1 "$USER_KEY"
-ra=$(header a1 retry-after)
-if [[ $STATUS == 429 ]] && grep -q 'quota reserve hold' "$RUN/a1.body" && grep -q '"rate_limit_error"' "$RUN/a1.body" && [[ -n $ra ]]; then
-    pass "a1 non-exempt 429, reserve message, Retry-After=$ra"
+if [[ $STATUS == 200 ]]; then
+    pass "a1 non-exempt 200: a claude-api-key at 0.97 is not a Max login, no reserve"
 else
-    fail "a1 non-exempt: status=$STATUS retry-after='$ra' body=$(cat "$RUN/a1.body")"
+    fail "a1 non-exempt: status=$STATUS body=$(cat "$RUN/a1.body")"
 fi
 claude a2 "$AUTO_KEY"
 [[ $STATUS == 200 ]] && pass "a2 exempt 200" || fail "a2 exempt: $STATUS $(cat "$RUN/a2.body")"
@@ -198,14 +198,16 @@ STATE=$RUN/auth/reserve-gate.state
 kill "$PROXY_PID" 2>/dev/null; wait "$PROXY_PID" 2>/dev/null
 write_config "    enabled: true"
 start_proxy "$RUN/proxy-restart.log"
-hits_before=$(grep -c '^/v1/messages' "$RUN/upstream.hits" 2>/dev/null || true)
-claude e1 "$USER_KEY"
-hits_after=$(grep -c '^/v1/messages' "$RUN/upstream.hits" 2>/dev/null || true)
-re=$(header e1 retry-after)
-if [[ $STATUS == 429 ]] && grep -q 'quota reserve hold' "$RUN/e1.body" && [[ -n $re && $hits_after == "$hits_before" ]]; then
-    pass "e1 after restart non-exempt 429 from the state file, Retry-After=$re, upstream not reached"
+if grep -q '0.97' "$STATE" 2>/dev/null; then
+    pass "e0 state file keeps the 0.97 reading across the restart"
 else
-    fail "e1 after restart: status=$STATUS retry-after='$re' hits $hits_before->$hits_after body=$(cat "$RUN/e1.body")"
+    fail "e0 state file has no 0.97 reading"
+fi
+claude e1 "$USER_KEY"
+if [[ $STATUS == 200 ]]; then
+    pass "e1 after restart non-exempt 200 (API key not reserve-held)"
+else
+    fail "e1 after restart: status=$STATUS body=$(cat "$RUN/e1.body")"
 fi
 claude e2 "$AUTO_KEY"
 [[ $STATUS == 200 ]] && pass "e2 exempt 200 after restart" || fail "e2 exempt: $STATUS $(cat "$RUN/e2.body")"
@@ -222,9 +224,9 @@ if grep -q -e "$USER_KEY" -e "$AUTO_KEY" "$RUN/proxy.log" "$RUN/proxy-restart.lo
 else
     pass "proxy log has no client keys"
 fi
-# Exempt a0, a2, b2, c1, c2 and e2 reach the upstream; the refused a1, b1 and e1 must not.
+# a0, a1, a2, b2, c1, c2, e1 and e2 reach the upstream; the refused b1 must not.
 claude_hits=$(grep -c '^/v1/messages' "$RUN/upstream.hits" 2>/dev/null || true)
-[[ $claude_hits == 6 ]] && pass "refused requests never reached the upstream (6 Claude upstream hits)" || fail "Claude upstream hits = $claude_hits, want 6"
+[[ $claude_hits == 8 ]] && pass "the refused request never reached the upstream (8 Claude upstream hits)" || fail "Claude upstream hits = $claude_hits, want 8"
 grep -h 'reserve gate:' "$RUN/proxy.log" "$RUN/proxy-restart.log" | sed 's/^/log: /'
 printf 'upstream hits: %s\n' "$(sort "$RUN/upstream.hits" | uniq -c | tr -s ' ' | tr '\n' ';')"
 

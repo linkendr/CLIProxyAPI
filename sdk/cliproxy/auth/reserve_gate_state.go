@@ -18,8 +18,10 @@ import (
 // reserveStateVersion is the version of the reserve gate state file.
 const reserveStateVersion = 1
 
-// reserveStateFile is the reserve gate state file: per account ID and window ("5h",
-// "7d"), the last known reading and the hold. It holds no credential data.
+// reserveStateFile is the reserve gate state file: per account ID and window ("7d"), the
+// last known reading and the hold. It holds no credential data. Files written by older
+// builds may carry a "5h" window or fields this build does not know; the loader skips
+// the window and JSON decoding ignores the fields.
 type reserveStateFile struct {
 	Version   int                                      `json:"version"`
 	UpdatedAt time.Time                                `json:"updated_at"`
@@ -31,7 +33,8 @@ type reserveStateWindow struct {
 	ResetAt     int64     `json:"reset_at,omitempty"` // Unix seconds; 0 if unknown
 	ObservedAt  time.Time `json:"observed_at"`
 	Held        bool      `json:"held,omitempty"`
-	HeldUntil   int64     `json:"held_until,omitempty"` // Unix seconds; 0 if unknown
+	HeldUntil   int64     `json:"held_until,omitempty"` // Unix seconds the hold lifts (a limit step or the reset); 0 if unknown
+	Source      string    `json:"source,omitempty"`     // "usage" for a usage read; empty for response headers
 }
 
 // reserveStatePath returns the state file of an enabled gate: state-file, or
@@ -60,7 +63,8 @@ func reserveStatePath(cfg *internalconfig.Config) string {
 }
 
 // useStateFile points the book at path. A new path is read into the book: entries the
-// book already knows stay as they are, and entries whose window has reset are dropped.
+// book already knows stay as they are, entries whose window has reset are dropped, and
+// windows the gate no longer reads (5h) are skipped.
 // A missing or unreadable file leaves the book as it is, with a log line.
 func (b *reserveHoldBook) useStateFile(path string, now time.Time) {
 	b.mu.Lock()
@@ -92,6 +96,9 @@ func (b *reserveHoldBook) useStateFile(path string, now time.Time) {
 				continue
 			}
 			reading := reserveReading{utilization: entry.Utilization, resetAt: unixOrZero(entry.ResetAt), observedAt: entry.ObservedAt}
+			if entry.Source == reserveReadingFromUsage {
+				reading.source = reserveReadingFromUsage
+			}
 			if !reading.resetAt.IsZero() && !reading.resetAt.After(now) {
 				continue
 			}
@@ -138,7 +145,7 @@ func (b *reserveHoldBook) save(now time.Time) {
 		if !reading.resetAt.IsZero() && !reading.resetAt.After(now) {
 			continue
 		}
-		entry := reserveStateWindow{Utilization: reading.utilization, ResetAt: unixOrZeroOf(reading.resetAt), ObservedAt: reading.observedAt.UTC()}
+		entry := reserveStateWindow{Utilization: reading.utilization, ResetAt: unixOrZeroOf(reading.resetAt), ObservedAt: reading.observedAt.UTC(), Source: reading.source}
 		if hold, held := b.holds[key]; held && hold.held {
 			entry.Held, entry.HeldUntil = true, unixOrZeroOf(hold.until)
 		}
@@ -161,7 +168,12 @@ func writeReserveStateFile(path string, file reserveStateFile) error {
 	if errMarshal != nil {
 		return errMarshal
 	}
-	data = append(data, '\n')
+	return writeStateFileAtomic(path, append(data, '\n'))
+}
+
+// writeStateFileAtomic replaces path with data: a temp file in the same directory, mode
+// 0600, synced, then renamed over path.
+func writeStateFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if errMkdir := os.MkdirAll(dir, 0o700); errMkdir != nil {
 		return errMkdir

@@ -92,8 +92,10 @@ func TestPluginErrorCarriesRetryAfterIntoCooldownAndHTTPHeader(t *testing.T) {
 	if errExec == nil {
 		t.Fatal("authMgr.Execute returned nil error")
 	}
-	if got := coreauth.SafeResponseHeaders(errExec).Get("Retry-After"); got != "7" {
-		t.Fatalf("SafeResponseHeaders(errExec) Retry-After = %q, want 7", got)
+	// The manager raises the 7s hint to its quota cooldown floor (10s), and the header
+	// reports the cooldown the auth really has.
+	if got := coreauth.SafeResponseHeaders(errExec).Get("Retry-After"); got != "10" {
+		t.Fatalf("SafeResponseHeaders(errExec) Retry-After = %q, want 10 (the cooldown floor)", got)
 	}
 	updated, okAuth := authMgr.GetByID(authID)
 	if !okAuth || updated == nil {
@@ -101,7 +103,7 @@ func TestPluginErrorCarriesRetryAfterIntoCooldownAndHTTPHeader(t *testing.T) {
 	}
 	state := updated.ModelStates[model]
 	if state == nil || !state.NextRetryAfter.After(before.Add(5*time.Second)) {
-		t.Fatalf("model NextRetryAfter = %v, want at least %v (7s cooldown)", state, before.Add(7*time.Second))
+		t.Fatalf("model NextRetryAfter = %v, want after %v (the 7s hint, raised to the 10s floor)", state, before.Add(5*time.Second))
 	}
 }
 

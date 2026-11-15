@@ -175,7 +175,11 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 		m.homeSessionAliases.clear()
 	}
 	m.runtimeConfig.Store(cfg)
-	m.reserveGate.Store(compileReserveGate(cfg.Routing.ReserveGate))
+	compiledReserveGate := compileReserveGate(cfg.Routing.ReserveGate)
+	m.reserveGate.Store(compiledReserveGate)
+	if compiledReserveGate == nil {
+		m.reserveTrigger.clear()
+	}
 	m.reserveHolds.useStateFile(reserveStatePath(cfg), time.Now())
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
 	if clearedCooldowns && oldCooldownStore != nil {
@@ -1058,8 +1062,19 @@ func dedupeStrings(values []string) []string {
 	return out
 }
 
-// ResetQuota clears quota/cooldown state for an auth and resumes registry routing.
+// ResetQuota clears quota/cooldown state for an auth and resumes registry routing. For a
+// Claude credential it also drops the passive quota snapshot and the reserve gate's
+// reading: both describe the window before the reset, and a stale reading would keep
+// the login held.
 func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []string, error) {
+	return m.resetQuotaIf(ctx, authID, nil, time.Time{})
+}
+
+// resetQuotaIf is ResetQuota with a condition that is checked under m.mu, in the same
+// critical section as the reset, so a cooldown recorded after the caller looked is not
+// cleared. A nil due always resets. A reset that due refuses returns no auth. A reserve
+// reading observed after keepAfter survives the reset (zero keeps none).
+func (m *Manager) resetQuotaIf(ctx context.Context, authID string, due func(auth *Auth) bool, keepAfter time.Time) (*Auth, []string, error) {
 	if m == nil {
 		return nil, nil, nil
 	}
@@ -1078,7 +1093,7 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 	defer releaseMutation()
 	m.mu.Lock()
 	auth, ok := m.auths[authID]
-	if !ok || auth == nil {
+	if !ok || auth == nil || (due != nil && !due(auth)) {
 		m.mu.Unlock()
 		return nil, nil, nil
 	}
@@ -1105,6 +1120,15 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 	} else if len(auth.ModelStates) > 0 {
 		updateAggregatedAvailability(auth, now)
 	}
+	dropReserveReading := isClaudeAuth(auth)
+	if dropReserveReading {
+		auth.Quota.ClearObservationSignals()
+		for _, state := range auth.ModelStates {
+			if state != nil {
+				state.Quota.ClearObservationSignals()
+			}
+		}
+	}
 
 	if len(models) == 0 {
 		models = append(models, registeredModels...)
@@ -1129,6 +1153,13 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 	m.mu.Unlock()
 	releaseMutation()
 
+	if dropReserveReading {
+		m.reserveHolds.drop(authID, keepAfter, now)
+		if gate := m.reserveGate.Load(); gate != nil {
+			m.observeReserveTrigger(gate, now)
+		}
+		defer m.syncQuotaState(now)
+	}
 	defer func() {
 		if cooldownStateChanged {
 			m.persistCooldownStates(context.Background())
@@ -2178,6 +2209,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	releaseMutation()
 	if authSnapshot != nil && !result.SkipQuotaObservation {
 		m.recordReserveReadings(authSnapshot)
+	}
+	if authSnapshot != nil && isClaudeAuth(authSnapshot) {
+		m.syncQuotaState(time.Now())
 	}
 	if m.scheduler != nil && authSnapshot != nil {
 		credentialScopedResult := result.CredentialScope || scheduleUnauthorizedRefresh

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
@@ -212,6 +214,75 @@ func (r *reserveRig) coolDown(t *testing.T, authIDs ...string) {
 	}
 }
 
+// limitAt records an upstream 429 on the shared 7d window, as the executor result path
+// does: the response carries the rejected 7d reading and the credential cools down.
+func (r *reserveRig) limitAt(t *testing.T, authID string, reset time.Time) {
+	t.Helper()
+	headers := unifiedHeaders(map[string]float64{"7d": 1.0}, reset)
+	headers.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+	headers.Set("Anthropic-Ratelimit-Unified-7d-Status", "rejected")
+	ctx := internallogging.WithResponseHeadersHolder(context.Background())
+	internallogging.SetResponseHeaders(ctx, headers)
+	retry := 3 * time.Hour
+	r.manager.MarkResult(ctx, Result{
+		AuthID:          authID,
+		Provider:        "claude",
+		Model:           reserveTestClaudeModel,
+		Success:         false,
+		RetryAfter:      &retry,
+		CredentialScope: true,
+		Error:           &Error{HTTPStatus: http.StatusTooManyRequests, Message: "limit"},
+	})
+}
+
+// disable turns one credential off the way an operator does.
+func (r *reserveRig) disable(t *testing.T, authID string) {
+	t.Helper()
+	r.manager.mu.RLock()
+	auth := r.manager.auths[authID].Clone()
+	r.manager.mu.RUnlock()
+	auth.Disabled = true
+	auth.Status = StatusDisabled
+	if _, err := r.manager.Update(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Update(%s): %v", authID, err)
+	}
+}
+
+// requireRetryAfterNear checks the hold's Retry-After against an expected reset.
+func requireRetryAfterNear(t *testing.T, err error, reset time.Time) {
+	t.Helper()
+	retryAfter, errParse := strconv.Atoi(SafeResponseHeaders(err).Get("Retry-After"))
+	want := int(time.Until(reset).Seconds())
+	if errParse != nil || retryAfter < want-60 || retryAfter > want+60 {
+		t.Fatalf("Retry-After = %q, want about %d seconds (reset %s)", SafeResponseHeaders(err).Get("Retry-After"), want, reset.UTC().Format(time.RFC3339))
+	}
+	if local := reset.In(time.Local).Format(quotaRefusalTimeLayout); !strings.Contains(err.Error(), local) {
+		t.Fatalf("message %s does not name the earliest reset in local time (%s)", err.Error(), local)
+	}
+	requireRefusalCountdownNear(t, err.Error(), reset)
+}
+
+// resetAfterPattern reads the countdown at the end of a refusal message.
+var resetAfterPattern = regexp.MustCompile(`\(reset after (?:(\d+)h ?)?(?:(\d+)m ?)?(?:(\d+)s)?\)`)
+
+// requireRefusalCountdownNear checks that message carries the countdown
+// and that it ends at reset.
+func requireRefusalCountdownNear(t *testing.T, message string, reset time.Time) {
+	t.Helper()
+	match := resetAfterPattern.FindStringSubmatch(message)
+	if match == nil {
+		t.Fatalf("message %s has no (reset after ...) countdown", message)
+	}
+	var seconds int
+	for index, unit := range []int{3600, 60, 1} {
+		value, _ := strconv.Atoi(match[index+1])
+		seconds += value * unit
+	}
+	if want := int(time.Until(reset).Seconds()); seconds < want-60 || seconds > want+60 {
+		t.Fatalf("countdown %q = %d seconds, want about %d", match[0], seconds, want)
+	}
+}
+
 func reserveSelectors() map[string]func() Selector {
 	return map[string]func() Selector{
 		// Built-in selector: pickNext and pickNextMixed take the scheduler fast path.
@@ -263,7 +334,7 @@ func requireReserveHold(t *testing.T, err error) *reserveHoldError {
 	if errJSON := json.Unmarshal([]byte(err.Error()), &body); errJSON != nil {
 		t.Fatalf("error body %q is not JSON: %v", err.Error(), errJSON)
 	}
-	if body.Type != "error" || body.Error.Type != "rate_limit_error" || !strings.HasPrefix(body.Error.Message, "quota reserve hold:") {
+	if body.Type != "error" || body.Error.Type != "rate_limit_error" || !strings.HasPrefix(strings.ToLower(body.Error.Message), "quota reserve hold:") {
 		t.Fatalf("error body = %s, want Anthropic rate_limit_error with a quota reserve hold message", err.Error())
 	}
 	if strings.Contains(body.Error.Message, "cooling down") {
@@ -275,7 +346,7 @@ func requireReserveHold(t *testing.T, err error) *reserveHoldError {
 func TestReserveGateDisabledLeavesSelectionUnchanged(t *testing.T) {
 	forEachReserveRig(t, internalconfig.ReserveGateConfig{}, func(t *testing.T, rig *reserveRig) {
 		reset := time.Now().Add(2 * time.Hour)
-		rig.observe(t, rig.a, "5h", 0.99, reset)
+		rig.observe(t, rig.a, "7d", 0.99, reset)
 		rig.observe(t, rig.b, "7d", 0.99, reset)
 		auth, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
 		if err != nil || auth == nil {
@@ -284,40 +355,54 @@ func TestReserveGateDisabledLeavesSelectionUnchanged(t *testing.T) {
 	})
 }
 
-func TestReserveGateSkipsHeldAccountForNonExemptCaller(t *testing.T) {
+// Case 1: the reserve is shared. While one Max login still has room, a held login is
+// not blocked for an ordinary caller: it may be drained up to its real limit, and the
+// other login stays usable too.
+func TestReserveGateSharedOneHeldLoginStillServes(t *testing.T) {
 	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
-		rig.observe(t, rig.a, "5h", 0.97, time.Now().Add(2*time.Hour))
-		rig.observe(t, rig.b, "5h", 0.40, time.Now().Add(2*time.Hour))
-		if seen := rig.picked(t, reserveTestUserKey, 6); seen[rig.a] != 0 || seen[rig.b] != 6 {
-			t.Fatalf("non-exempt picks = %v, want only %s", seen, rig.b)
+		// a resets last, so its 3% is all reserve: a is held.
+		rig.observe(t, rig.a, "7d", 0.97, time.Now().Add(6*24*time.Hour))
+		rig.observe(t, rig.b, "7d", 0.30, time.Now().Add(7*time.Hour))
+		check := rig.manager.reserveCheckFor(reserveOpts(reserveTestUserKey, ""))
+		rig.manager.mu.RLock()
+		blockedA, blockedB := check.blocks(rig.manager.auths[rig.a]), check.blocks(rig.manager.auths[rig.b])
+		rig.manager.mu.RUnlock()
+		if blockedA || blockedB {
+			t.Fatalf("blocks(a held 0.97) = %v, blocks(b 0.30) = %v; want neither blocked while b has room", blockedA, blockedB)
 		}
-		// A 7-day reading holds the same way.
-		rig.observe(t, rig.a, "5h", 0.10, time.Now().Add(2*time.Hour))
-		rig.observe(t, rig.a, "7d", 0.95, time.Now().Add(48*time.Hour))
-		if seen := rig.picked(t, reserveTestUserKey, 6); seen[rig.a] != 0 {
-			t.Fatalf("non-exempt picks = %v, want %s held on its 7d window", seen, rig.a)
+		if !check.accountHold(&Auth{ID: rig.a}).held {
+			t.Fatal("a at 0.97 is not recorded as held")
+		}
+		// The reset-ranking selectors spend b first; the pinned picks below show a served.
+		if seen := rig.picked(t, reserveTestUserKey, 8); seen[rig.a]+seen[rig.b] != 8 {
+			t.Fatalf("non-exempt picks = %v, want only Max logins", seen)
+		}
+		for _, target := range []string{rig.a, rig.b} {
+			opts := reserveOpts(reserveTestUserKey, "")
+			opts.Metadata[cliproxyexecutor.PinnedAuthMetadataKey] = target
+			auth, _, err := rig.manager.pickNext(context.Background(), "claude", reserveTestClaudeModel, opts, nil)
+			if err != nil || auth.ID != target {
+				t.Fatalf("pinned pick of %s = %v, %v; want it served", target, auth, err)
+			}
 		}
 	})
 }
 
+// Case 2: every Max login held: 90 minutes before b's reset the reserve is 1%, and the
+// logins have only that left. The ordinary caller is blocked from both and gets the
+// reserve 429 with Retry-After at the earliest release (the final hour before b's reset,
+// when no reserve is kept); the exempt caller is served.
 func TestReserveGateAllHeldReturns429WithRetryAfter(t *testing.T) {
 	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
 		soon := time.Now().Add(90 * time.Minute).Truncate(time.Second)
-		rig.observe(t, rig.a, "7d", 0.96, time.Now().Add(72*time.Hour))
-		rig.observe(t, rig.b, "5h", 0.99, soon)
+		rig.observe(t, rig.a, "7d", 0.99, time.Now().Add(72*time.Hour))
+		rig.observe(t, rig.b, "7d", 1.00, soon)
 		_, err := rig.pick(reserveTestUserKey, "s1", reserveTestClaudeModel)
 		hold := requireReserveHold(t, err)
 		if !isRequestStopError(err) {
 			t.Fatal("reserve hold error must stop the request, not retry it")
 		}
-		if !strings.Contains(err.Error(), soon.UTC().Format(time.RFC3339)) {
-			t.Fatalf("message %s does not name the earliest reset %s", err.Error(), soon.UTC().Format(time.RFC3339))
-		}
-		headers := SafeResponseHeaders(err)
-		retryAfter, errParse := strconv.Atoi(headers.Get("Retry-After"))
-		if errParse != nil || retryAfter < 80*60 || retryAfter > 91*60 {
-			t.Fatalf("Retry-After = %q, want about 90 minutes", headers.Get("Retry-After"))
-		}
+		requireRetryAfterNear(t, err, soon.Add(-time.Hour))
 		if hold.resetAt.IsZero() {
 			t.Fatal("hold error has no reset time")
 		}
@@ -328,49 +413,126 @@ func TestReserveGateAllHeldReturns429WithRetryAfter(t *testing.T) {
 	})
 }
 
-func TestReserveGateHysteresis(t *testing.T) {
+// Case 3: one Max login at its real limit (a 429 on the shared window, cooling down) and
+// the other only held: the ordinary caller gets the reserve 429, not the credit key, and
+// Retry-After names the earliest release, when the reserve drops to 1% 6 h before the
+// limited login's reset. The exempt caller gets the held login.
+func TestReserveGateOneLimitedOneHeldReturnsReserve429(t *testing.T) {
 	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
-		reset := time.Now().Add(3 * time.Hour)
-		heldA := func() bool {
-			return rig.picked(t, reserveTestUserKey, 4)[rig.a] == 0
+		limitReset := time.Now().Add(30 * time.Hour).Truncate(time.Second)
+		heldReset := time.Now().Add(48 * time.Hour).Truncate(time.Second)
+		rig.limitAt(t, rig.a, limitReset)
+		rig.observe(t, rig.b, "7d", 0.96, heldReset)
+		_, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
+		requireReserveHold(t, err)
+		requireRetryAfterNear(t, err, limitReset.Add(-6*time.Hour))
+		auth, errExempt := rig.pick(reserveTestExemptKey, "", reserveTestClaudeModel)
+		if errExempt != nil || auth.ID != rig.b {
+			t.Fatalf("exempt pick = %v, %v; want held %s", auth, errExempt, rig.b)
 		}
-		rig.observe(t, rig.a, "5h", 0.93, reset)
-		if heldA() {
-			t.Fatal("0.93 without a previous hold must not hold")
+	})
+}
+
+// A Max login cooling down at a real limit has no room even when its 429 carried no
+// reading: the other, held login is not drained for the ordinary caller, and the credit
+// key does not serve either.
+func TestReserveGateLimitedLoginWithoutReadingHasNoRoom(t *testing.T) {
+	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
+		rig.coolDown(t, rig.a)
+		rig.observe(t, rig.b, "7d", 0.97, time.Now().Add(48*time.Hour))
+		if auth, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel); err == nil {
+			t.Fatalf("pick = %s, want no credential (b held, a at its limit, credit key ineligible)", auth.ID)
 		}
-		rig.observe(t, rig.a, "5h", 0.96, reset)
-		if !heldA() {
-			t.Fatal("0.96 must hold")
+	})
+}
+
+// Case 4: both Max logins really at their limit: everyone, the ordinary caller included,
+// gets the credit key. A reserve hold alone never lets the credit key serve.
+func TestReserveGateCreditKeyServesNonExemptCallerOnlyAtRealLimit(t *testing.T) {
+	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
+		rig.observe(t, rig.a, "7d", 0.98, time.Now().Add(48*time.Hour))
+		rig.observe(t, rig.b, "7d", 0.99, time.Now().Add(25*time.Hour))
+		_, err := rig.pick(reserveTestUserKey, "s0", reserveTestClaudeModel)
+		requireReserveHold(t, err)
+		rig.limitAt(t, rig.a, time.Now().Add(48*time.Hour))
+		rig.limitAt(t, rig.b, time.Now().Add(time.Hour))
+		for _, key := range []string{reserveTestExemptKey, reserveTestUserKey} {
+			auth, errPick := rig.pick(key, "s-"+key, reserveTestClaudeModel)
+			if errPick != nil || auth.ID != rig.credit {
+				t.Fatalf("pick for %q with both accounts limited = %v, %v; want credit key %s", key, auth, errPick, rig.credit)
+			}
 		}
-		rig.observe(t, rig.a, "5h", 0.93, reset)
-		if !heldA() {
-			t.Fatal("0.93 after a hold must stay held (resume-below 0.90)")
+	})
+}
+
+// The same with cooldowns that carried no reading.
+func TestReserveGateCreditKeyServesWhenBothCoolWithoutReadings(t *testing.T) {
+	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
+		rig.coolDown(t, rig.a, rig.b)
+		auth, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
+		if err != nil || auth.ID != rig.credit {
+			t.Fatalf("pick = %v, %v; want credit key %s", auth, err, rig.credit)
 		}
-		rig.observe(t, rig.a, "5h", 0.89, reset)
-		if heldA() {
-			t.Fatal("0.89 must release the hold")
+	})
+}
+
+// Case 5: a disabled Max login does not count as having room, so the only enabled,
+// held login is blocked for the ordinary caller.
+func TestReserveGateDisabledLoginDoesNotCountAsRoom(t *testing.T) {
+	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
+		reset := time.Now().Add(29 * time.Hour).Truncate(time.Second)
+		rig.observe(t, rig.a, "7d", 0.97, reset)
+		rig.disable(t, rig.b)
+		_, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
+		requireReserveHold(t, err)
+		// At 97% a is released when its limit rises to 99%, 6 h before its reset.
+		requireRetryAfterNear(t, err, reset.Add(-6*time.Hour))
+		if seen := rig.picked(t, reserveTestExemptKey, 3); seen[rig.a] != 3 {
+			t.Fatalf("exempt picks = %v, want %s", seen, rig.a)
+		}
+	})
+}
+
+// The pool holds at the reserve and releases as soon as it has more: there is no resume
+// level. b has nothing left, so a alone decides whether anything has room.
+func TestReserveGateHoldsAtThresholdWithoutHysteresis(t *testing.T) {
+	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
+		reset := time.Now().Add(30 * time.Hour)
+		rig.observe(t, rig.b, "7d", 1.00, reset)
+		served := func() bool {
+			_, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
+			return err == nil
+		}
+		rig.observe(t, rig.a, "7d", 0.94, reset)
+		if !served() {
+			t.Fatal("0.94 must leave room")
+		}
+		rig.observe(t, rig.a, "7d", 0.95, reset)
+		if served() {
+			t.Fatal("0.95 (threshold) must hold, and with b empty nothing has room")
+		}
+		rig.observe(t, rig.a, "7d", 0.94, reset)
+		if !served() {
+			t.Fatal("0.94 after a hold must release it (no resume-below)")
 		}
 	})
 }
 
 func TestReserveGatePassedResetReleases(t *testing.T) {
 	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
-		rig.observe(t, rig.a, "5h", 0.97, time.Now().Add(time.Hour))
-		if rig.picked(t, reserveTestUserKey, 4)[rig.a] != 0 {
-			t.Fatal("0.97 must hold")
+		rig.observe(t, rig.b, "7d", 0.98, time.Now().Add(48*time.Hour))
+		rig.observe(t, rig.a, "7d", 0.98, time.Now().Add(25*time.Hour))
+		if _, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel); err == nil {
+			t.Fatal("both at 0.98 must hold")
 		}
-		// The window rolled over: the stale reading no longer holds, and neither does
-		// the old hysteresis state when the first reading of the new window is 0.92.
-		rig.observe(t, rig.a, "5h", 0.97, time.Now().Add(-time.Second))
-		if rig.picked(t, reserveTestUserKey, 4)[rig.a] == 0 {
-			t.Fatal("a reading whose reset has passed must not hold")
+		// a's window rolled over: its stale reading no longer holds, so a has room.
+		rig.observe(t, rig.a, "7d", 0.97, time.Now().Add(-time.Second))
+		if _, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel); err != nil {
+			t.Fatalf("a reading whose reset has passed must not hold: %v", err)
 		}
-		rig.observe(t, rig.a, "5h", 0.97, time.Now().Add(time.Hour))
-		rig.picked(t, reserveTestUserKey, 1)
-		rig.observe(t, rig.a, "5h", 0.97, time.Now().Add(-time.Second))
-		rig.observe(t, rig.a, "5h", 0.92, time.Now().Add(5*time.Hour))
-		if rig.picked(t, reserveTestUserKey, 4)[rig.a] == 0 {
-			t.Fatal("a hold from a window that has reset must not carry into the next window")
+		rig.observe(t, rig.a, "7d", 0.10, time.Now().Add(7*24*time.Hour))
+		if _, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel); err != nil {
+			t.Fatalf("a's new window must have room: %v", err)
 		}
 	})
 }
@@ -384,8 +546,22 @@ func TestReserveGateNoSignalsIsEligible(t *testing.T) {
 	})
 }
 
+// A login with no reading counts as having room, so a held login stays usable.
+func TestReserveGateLoginWithoutReadingCountsAsRoom(t *testing.T) {
+	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
+		rig.observe(t, rig.a, "7d", 0.99, time.Now().Add(5*time.Hour))
+		if seen := rig.picked(t, reserveTestUserKey, 6); seen[rig.a]+seen[rig.b] != 6 {
+			t.Fatalf("non-exempt picks = %v, want Max logins served", seen)
+		}
+	})
+}
+
+// Case 6: a manual hold still refuses every Claude credential for ordinary callers,
+// even with every Max login well below threshold.
 func TestReserveGateManualHold(t *testing.T) {
 	forEachReserveRig(t, reserveGateOn(func(g *internalconfig.ReserveGateConfig) { g.Hold = true }), func(t *testing.T, rig *reserveRig) {
+		rig.observe(t, rig.a, "7d", 0.10, time.Now().Add(48*time.Hour))
+		rig.observe(t, rig.b, "7d", 0.20, time.Now().Add(48*time.Hour))
 		_, err := rig.pick(reserveTestUserKey, "s1", reserveTestClaudeModel)
 		hold := requireReserveHold(t, err)
 		if !hold.manual {
@@ -408,24 +584,20 @@ func TestReserveGateManualHold(t *testing.T) {
 	})
 }
 
-func TestReserveGateExcludesCreditKeyForNonExemptCaller(t *testing.T) {
-	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
+func TestReserveGateManualHoldBlocksCreditKey(t *testing.T) {
+	forEachReserveRig(t, reserveGateOn(func(g *internalconfig.ReserveGateConfig) { g.Hold = true }), func(t *testing.T, rig *reserveRig) {
 		rig.coolDown(t, rig.a, rig.b)
-		auth, err := rig.pick(reserveTestExemptKey, "s1", reserveTestClaudeModel)
-		if err != nil || auth.ID != rig.credit {
-			t.Fatalf("exempt pick with both accounts limited = %v, %v; want credit key %s", auth, err, rig.credit)
-		}
-		auth, err = rig.pick(reserveTestUserKey, "s2", reserveTestClaudeModel)
-		if err == nil {
-			t.Fatalf("non-exempt pick = %s, want no credential", auth.ID)
+		_, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
+		if hold := requireReserveHold(t, err); !hold.manual {
+			t.Fatal("manual hold bypassed")
 		}
 	})
 }
 
 func TestReserveGateLeavesCodexUnaffected(t *testing.T) {
 	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
-		rig.observe(t, rig.a, "5h", 0.99, time.Now().Add(time.Hour))
-		rig.observe(t, rig.b, "5h", 0.99, time.Now().Add(time.Hour))
+		rig.observe(t, rig.a, "7d", 0.99, time.Now().Add(time.Hour))
+		rig.observe(t, rig.b, "7d", 0.99, time.Now().Add(time.Hour))
 		auth, err := rig.pick(reserveTestUserKey, "", reserveTestGPTModel)
 		if err != nil || auth.ID != rig.codex {
 			t.Fatalf("codex pick = %v, %v; want %s", auth, err, rig.codex)
@@ -433,7 +605,9 @@ func TestReserveGateLeavesCodexUnaffected(t *testing.T) {
 	})
 }
 
-func TestReserveGateRebindsSessionBoundToHeldAccount(t *testing.T) {
+// A session bound to a login that becomes held keeps being served while the other login
+// has room, and is refused once both are held (4% left, below the 5% reserve).
+func TestReserveGateSessionBoundToHeldAccount(t *testing.T) {
 	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
 		first, err := rig.pick(reserveTestUserKey, "bound-session", reserveTestClaudeModel)
 		if err != nil {
@@ -443,32 +617,37 @@ func TestReserveGateRebindsSessionBoundToHeldAccount(t *testing.T) {
 		if first.ID == rig.a {
 			other = rig.b
 		}
-		rig.observe(t, first.ID, "5h", 0.97, time.Now().Add(time.Hour))
+		rig.observe(t, first.ID, "7d", 0.98, time.Now().Add(25*time.Hour))
 		for i := 0; i < 3; i++ {
 			auth, errPick := rig.pick(reserveTestUserKey, "bound-session", reserveTestClaudeModel)
-			if errPick != nil || auth.ID != other {
-				t.Fatalf("pick #%d for a session bound to held %s = %v, %v; want %s", i, first.ID, auth, errPick, other)
+			if errPick != nil || (auth.ID != first.ID && auth.ID != other) {
+				t.Fatalf("pick #%d for a session bound to held %s = %v, %v; want a Max login", i, first.ID, auth, errPick)
 			}
 		}
+		rig.observe(t, other, "7d", 0.98, time.Now().Add(26*time.Hour))
+		_, errPick := rig.pick(reserveTestUserKey, "bound-session", reserveTestClaudeModel)
+		requireReserveHold(t, errPick)
 	})
 }
 
 // Every upstream response replaces the credential snapshot, so a model whose response
 // lacked unified headers can leave the older reading only in a model snapshot. The gate
-// takes, per window, the newest snapshot that carries that window's utilization.
+// takes, per window, the newest snapshot that carries that window's utilization. b has
+// nothing left, so a's reading alone decides.
 func TestReserveGateUsesFreshestReadingAcrossModelSnapshots(t *testing.T) {
 	rig := newReserveRig(t, &EarliestResetSelector{}, true, reserveGateOn(nil))
 	now := time.Now()
-	reset := now.Add(2 * time.Hour)
-	rig.observeAt(t, rig.a, "", "5h", 0.50, reset, now.Add(-10*time.Minute))
-	rig.observeAt(t, rig.a, "other-model", "5h", 0.97, reset, now.Add(-time.Minute))
-	if rig.picked(t, reserveTestUserKey, 4)[rig.a] != 0 {
+	reset := now.Add(26 * time.Hour)
+	rig.observe(t, rig.b, "7d", 1.00, now.Add(48*time.Hour))
+	rig.observeAt(t, rig.a, "", "7d", 0.50, reset, now.Add(-10*time.Minute))
+	rig.observeAt(t, rig.a, "other-model", "7d", 0.97, reset, now.Add(-time.Minute))
+	if _, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel); err == nil {
 		t.Fatal("newer 0.97 model reading must hold the account")
 	}
-	rig.observeAt(t, rig.a, "", "5h", 0.50, reset, now)
-	rig.observeAt(t, rig.a, "other-model", "5h", 0.97, reset, now.Add(-time.Hour))
-	if rig.picked(t, reserveTestUserKey, 4)[rig.a] == 0 {
-		t.Fatal("newer 0.50 credential reading must release the account")
+	rig.observeAt(t, rig.a, "", "7d", 0.50, reset, now)
+	rig.observeAt(t, rig.a, "other-model", "7d", 0.97, reset, now.Add(-time.Hour))
+	if _, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel); err != nil {
+		t.Fatalf("newer 0.50 credential reading must release the account: %v", err)
 	}
 }
 
@@ -478,7 +657,7 @@ func TestReserveGateAppliesToExecuteStreamAndCount(t *testing.T) {
 	for name, selector := range reserveSelectors() {
 		t.Run(name, func(t *testing.T) {
 			rig := newReserveRig(t, selector(), true, reserveGateOn(nil))
-			rig.observe(t, rig.a, "5h", 0.99, time.Now().Add(time.Hour))
+			rig.observe(t, rig.a, "7d", 0.99, time.Now().Add(25*time.Hour))
 			rig.observe(t, rig.b, "7d", 0.99, time.Now().Add(24*time.Hour))
 			ctx := context.Background()
 			req := cliproxyexecutor.Request{Model: reserveTestClaudeModel}
@@ -536,8 +715,8 @@ func TestReserveGateConfigReloadTogglesGate(t *testing.T) {
 }
 
 // Without a credit key nothing else sends the round-robin rig off the scheduler fast
-// path, so this pins the gate's own detour: a held account is never handed out by the
-// scheduler, and an all-held pool gets the hold error, on single and mixed picks.
+// path, so this pins the gate's own detour: one held login does not leave the fast path
+// or the rotation, and an all-held pool gets the hold error, on single and mixed picks.
 func TestReserveGateOnSchedulerFastPathWithoutCreditKey(t *testing.T) {
 	for _, mixed := range []bool{false, true} {
 		t.Run(fmt.Sprintf("mixed=%v", mixed), func(t *testing.T) {
@@ -557,49 +736,41 @@ func TestReserveGateOnSchedulerFastPathWithoutCreditKey(t *testing.T) {
 			if seen := rig.picked(t, reserveTestUserKey, 4); seen[rig.a]+seen[rig.b] != 4 || seen[rig.a] == 0 || seen[rig.b] == 0 {
 				t.Fatalf("picks with nothing held = %v, want both accounts", seen)
 			}
-			rig.observe(t, rig.a, "5h", 0.98, time.Now().Add(time.Hour))
-			if seen := rig.picked(t, reserveTestUserKey, 6); seen[rig.b] != 6 {
-				t.Fatalf("non-exempt picks = %v, want only %s", seen, rig.b)
-			}
-			if seen := rig.picked(t, reserveTestExemptKey, 4); seen[rig.a] == 0 {
-				t.Fatalf("exempt picks = %v, want %s still in rotation", seen, rig.a)
+			rig.observe(t, rig.a, "7d", 0.98, time.Now().Add(25*time.Hour))
+			if seen := rig.picked(t, reserveTestUserKey, 6); seen[rig.a] == 0 || seen[rig.b] == 0 {
+				t.Fatalf("non-exempt picks with only %s held = %v, want both in rotation", rig.a, seen)
 			}
 			rig.observe(t, rig.b, "7d", 0.98, time.Now().Add(24*time.Hour))
 			_, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
 			requireReserveHold(t, err)
+			if seen := rig.picked(t, reserveTestExemptKey, 4); seen[rig.a] == 0 || seen[rig.b] == 0 {
+				t.Fatalf("exempt picks = %v, want both held accounts", seen)
+			}
 		})
 	}
 }
 
 // A pinned request accounts against the same eligible pool an unpinned request sees,
-// so a reserve-held peer must not enter the weighted accounting pool.
+// so a login the reserve gate blocks must not enter the weighted accounting pool. With
+// the shared reserve the gate blocks a Max login only while every Max login is held, so
+// the pinned credential that still serves is one of another provider on a mixed route.
 func TestReserveGateExcludesHeldPeerFromPinnedAccounting(t *testing.T) {
-	for _, mixed := range []bool{false, true} {
-		t.Run(fmt.Sprintf("mixed=%t", mixed), func(t *testing.T) {
-			weighted := &WeightedRoundRobinSelector{}
-			rig := newReserveRig(t, weighted, mixed, reserveGateOn(nil))
-			rig.observe(t, rig.a, "5h", 0.97, time.Now().Add(2*time.Hour))
-			opts := reserveOpts(reserveTestUserKey, "")
-			opts.Metadata[cliproxyexecutor.PinnedAuthMetadataKey] = rig.b
-			var picked *Auth
-			var err error
-			if mixed {
-				picked, _, _, err = rig.manager.pickNextMixedLegacy(context.Background(), []string{"claude"}, reserveTestClaudeModel, opts, nil)
-			} else {
-				picked, _, err = rig.manager.pickNextLegacy(context.Background(), "claude", reserveTestClaudeModel, opts, nil)
-			}
-			if err != nil || picked == nil || picked.ID != rig.b {
-				t.Fatalf("pinned pick = %v, %v, want %s", picked, err, rig.b)
-			}
-			route := "claude:" + reserveTestClaudeModel
-			if mixed {
-				route = "mixed:" + reserveTestClaudeModel
-			}
-			weightedStateForTest(t, weighted, route, rig.b)
-			held := map[string]int64{rig.a: 1, rig.b: 1}
-			if weighted.states[weightedPoolStateKey(route, held)] != nil {
-				t.Fatalf("pinned accounting pool included reserve-held %s", rig.a)
-			}
-		})
+	weighted := &WeightedRoundRobinSelector{}
+	rig := newReserveRig(t, weighted, true, reserveGateOn(nil))
+	rig.disable(t, rig.credit)
+	registry.GetGlobalRegistry().RegisterClient(rig.codex, "codex", []*registry.ModelInfo{{ID: reserveTestGPTModel}, {ID: reserveTestClaudeModel}})
+	rig.observe(t, rig.a, "7d", 0.99, time.Now().Add(25*time.Hour))
+	rig.observe(t, rig.b, "7d", 0.99, time.Now().Add(24*time.Hour))
+	opts := reserveOpts(reserveTestUserKey, "")
+	opts.Metadata[cliproxyexecutor.PinnedAuthMetadataKey] = rig.codex
+	picked, _, _, err := rig.manager.pickNextMixedLegacy(context.Background(), []string{"claude", "codex"}, reserveTestClaudeModel, opts, nil)
+	if err != nil || picked == nil || picked.ID != rig.codex {
+		t.Fatalf("pinned pick = %v, %v, want %s", picked, err, rig.codex)
+	}
+	route := "mixed:" + reserveTestClaudeModel
+	weightedStateForTest(t, weighted, route, rig.codex)
+	held := map[string]int64{rig.a: 1, rig.b: 1, rig.codex: 1}
+	if weighted.states[weightedPoolStateKey(route, held)] != nil {
+		t.Fatalf("pinned accounting pool included the reserve-held %s and %s", rig.a, rig.b)
 	}
 }

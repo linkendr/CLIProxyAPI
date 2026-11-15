@@ -13,80 +13,62 @@ import (
 	logtest "github.com/sirupsen/logrus/hooks/test"
 )
 
-func TestNextReserveHoldReleaseBeforeReset(t *testing.T) {
-	now := time.Unix(1_900_000_000, 0)
-	const threshold, resume = 0.95, 0.90
-	for name, tt := range map[string]struct {
-		utilization float64
-		resetIn     time.Duration // zero: reading without a reset
-		prevHeld    bool
-		release     time.Duration
-		wantHeld    bool
-	}{
-		"above threshold, reset within release window: released": {utilization: 0.97, resetIn: 30 * time.Minute, release: time.Hour},
-		"above threshold, reset exactly at the window: released": {utilization: 0.97, resetIn: time.Hour, release: time.Hour},
-		"above threshold, reset outside release window: held":    {utilization: 0.97, resetIn: 2 * time.Hour, release: time.Hour, wantHeld: true},
-		"hysteresis hold, reset within release window: released": {utilization: 0.92, resetIn: 30 * time.Minute, prevHeld: true, release: time.Hour},
-		"hysteresis hold, reset outside release window: held":    {utilization: 0.92, resetIn: 3 * time.Hour, prevHeld: true, release: time.Hour, wantHeld: true},
-		"release 0 keeps the old behavior":                       {utilization: 0.97, resetIn: time.Minute, wantHeld: true},
-		"release 0 keeps the old hysteresis":                     {utilization: 0.92, resetIn: time.Minute, prevHeld: true, wantHeld: true},
-		"unknown reset is never released":                        {utilization: 0.97, release: time.Hour, wantHeld: true},
-		"below threshold stays unheld":                           {utilization: 0.50, resetIn: 30 * time.Minute, release: time.Hour},
-	} {
-		t.Run(name, func(t *testing.T) {
-			reading := reserveReading{utilization: tt.utilization, observedAt: now}
-			if tt.resetIn != 0 {
-				reading.resetAt = now.Add(tt.resetIn)
-			}
-			prev := reserveHold{held: tt.prevHeld, until: reading.resetAt}
-			got := nextReserveHold(prev, reading, true, threshold, resume, tt.release, now)
-			if got.held != tt.wantHeld {
-				t.Fatalf("held = %v, want %v", got.held, tt.wantHeld)
-			}
-		})
-	}
+// The release before a reset is final-release-hours now (it replaced release-before-reset):
+// in the final hour before the next weekly reset of any Max login no reserve is kept.
+
+// finalReleaseGate is the gate with final-release-hours set to hours.
+func finalReleaseGate(hours int) internalconfig.ReserveGateConfig {
+	return reserveGateOn(func(g *internalconfig.ReserveGateConfig) { g.FinalReleaseHours = &hours })
 }
 
-func releaseGate(window string) internalconfig.ReserveGateConfig {
-	return reserveGateOn(func(g *internalconfig.ReserveGateConfig) { g.ReleaseBeforeReset = window })
-}
-
-func TestReserveGateReleaseBeforeResetFreesHeldWindow(t *testing.T) {
-	forEachReserveRig(t, releaseGate("1h"), func(t *testing.T, rig *reserveRig) {
-		// Outside the release window the 5h hold applies as before.
-		rig.observe(t, rig.a, "5h", 0.97, time.Now().Add(3*time.Hour))
-		if seen := rig.picked(t, reserveTestUserKey, 4); seen[rig.a] != 0 {
-			t.Fatalf("picks = %v, want %s held (reset in 3h, release-before-reset 1h)", seen, rig.a)
-		}
-		// The same window, now 30 minutes from its reset: released for everyone.
-		rig.observe(t, rig.a, "5h", 0.97, time.Now().Add(30*time.Minute))
-		rig.observe(t, rig.b, "5h", 0.97, time.Now().Add(3*time.Hour))
-		if seen := rig.picked(t, reserveTestUserKey, 4); seen[rig.a] != 4 {
-			t.Fatalf("picks = %v, want only %s (released 30m before reset; %s held)", seen, rig.a, rig.b)
-		}
-		// 7d windows release the same way.
-		rig.observe(t, rig.a, "7d", 0.99, time.Now().Add(20*time.Minute))
-		if seen := rig.picked(t, reserveTestUserKey, 4); seen[rig.a] != 4 {
-			t.Fatalf("picks = %v, want %s (7d window released before reset)", seen, rig.a)
-		}
-	})
-}
-
-func TestReserveGateReleaseBeforeResetDefaultOff(t *testing.T) {
+// Outside the final hour the last 1% is kept, so the ordinary caller is refused. The same
+// readings 30 minutes before the reset serve: nothing is kept any more.
+func TestReserveGateFinalReleaseFreesHeldLogin(t *testing.T) {
 	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
-		rig.observe(t, rig.a, "5h", 0.97, time.Now().Add(5*time.Minute))
-		if seen := rig.picked(t, reserveTestUserKey, 4); seen[rig.a] != 0 {
-			t.Fatalf("picks = %v, want %s held up to its reset without release-before-reset", seen, rig.a)
+		rig.observe(t, rig.a, "7d", 0.99, time.Now().Add(72*time.Hour))
+		rig.observe(t, rig.b, "7d", 1.00, time.Now().Add(90*time.Minute))
+		_, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
+		requireReserveHold(t, err)
+		rig.observe(t, rig.b, "7d", 1.00, time.Now().Add(30*time.Minute))
+		if seen := rig.picked(t, reserveTestUserKey, 4); seen[rig.a]+seen[rig.b] != 4 {
+			t.Fatalf("picks = %v, want Max logins served 30m before the reset (final release 1h)", seen)
+		}
+		check := rig.manager.reserveCheckFor(reserveOpts(reserveTestUserKey, ""))
+		if check.accountHold(&Auth{ID: rig.a}).held {
+			t.Fatalf("%s at 0.99 is still held 30m before the reset", rig.a)
 		}
 	})
 }
 
-func TestReserveGateReleaseBeforeResetKeepsManualHold(t *testing.T) {
-	gate := releaseGate("1h")
-	gate.Hold = true
+// A longer final release frees the held login earlier.
+func TestReserveGateFinalReleaseCustomWindow(t *testing.T) {
+	forEachReserveRig(t, finalReleaseGate(2), func(t *testing.T, rig *reserveRig) {
+		rig.observe(t, rig.a, "7d", 0.99, time.Now().Add(72*time.Hour))
+		rig.observe(t, rig.b, "7d", 1.00, time.Now().Add(90*time.Minute))
+		if seen := rig.picked(t, reserveTestUserKey, 4); seen[rig.a]+seen[rig.b] != 4 {
+			t.Fatalf("picks = %v, want Max logins served 90m before the reset (final release 2h)", seen)
+		}
+	})
+}
+
+// With final-release-hours 0 the last 1% is kept up to the reset itself.
+func TestReserveGateFinalReleaseOffHoldsUpToReset(t *testing.T) {
+	forEachReserveRig(t, finalReleaseGate(0), func(t *testing.T, rig *reserveRig) {
+		soon := time.Now().Add(5 * time.Minute).Truncate(time.Second)
+		rig.observe(t, rig.a, "7d", 0.99, time.Now().Add(72*time.Hour))
+		rig.observe(t, rig.b, "7d", 1.00, soon)
+		_, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
+		requireReserveHold(t, err)
+		requireRetryAfterNear(t, err, soon)
+	})
+}
+
+// The final release lifts the reserve, not the manual hold.
+func TestReserveGateFinalReleaseKeepsManualHold(t *testing.T) {
+	gate := reserveGateOn(func(g *internalconfig.ReserveGateConfig) { g.Hold = true })
 	forEachReserveRig(t, gate, func(t *testing.T, rig *reserveRig) {
-		rig.observe(t, rig.a, "5h", 0.97, time.Now().Add(10*time.Minute))
-		rig.observe(t, rig.b, "5h", 0.10, time.Now().Add(10*time.Minute))
+		rig.observe(t, rig.a, "7d", 0.99, time.Now().Add(72*time.Hour))
+		rig.observe(t, rig.b, "7d", 0.10, time.Now().Add(10*time.Minute))
 		_, err := rig.pick(reserveTestUserKey, "s1", reserveTestClaudeModel)
 		if hold := requireReserveHold(t, err); !hold.manual {
 			t.Fatal("manual hold error not marked manual")
@@ -94,42 +76,61 @@ func TestReserveGateReleaseBeforeResetKeepsManualHold(t *testing.T) {
 	})
 }
 
-// A hold persisted by an older build (same state file format) is released after a
-// restart once its window is within release-before-reset, and the release is logged.
-func TestReserveGateReleaseBeforeResetPersistedHold(t *testing.T) {
-	authDir := t.TempDir()
-	prefix := reserveStatePrefix()
-	reset := time.Now().Add(30 * time.Minute).Unix()
-	state := fmt.Sprintf(`{"version":1,"accounts":{%q:{"5h":{"utilization":0.97,"reset_at":%d,"observed_at":%q,"held":true,"held_until":%d}}}}`,
-		prefix+"a", reset, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339), reset)
-	path := filepath.Join(authDir, internalconfig.DefaultReserveGateStateFileName)
-	if errWrite := os.WriteFile(path, []byte(state), 0o600); errWrite != nil {
-		t.Fatal(errWrite)
-	}
-	hook := logtest.NewGlobal()
-	defer hook.Reset()
-	cfg := reserveStateConfig(authDir)
-	cfg.Routing.ReserveGate.ReleaseBeforeReset = "1h"
-	rig := newReserveRigWithConfig(t, &EarliestResetSelector{}, false, cfg, prefix)
-	rig.manager.Remove(WithSkipPersist(context.Background()), rig.b)
-	auth, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
-	if err != nil || auth.ID != rig.a {
-		t.Fatalf("pick = %v, %v; want %s released 30m before its reset", auth, err, rig.a)
-	}
-	logged := false
-	for _, entry := range hook.AllEntries() {
-		if strings.Contains(entry.Message, rig.a+" 5h window released before reset") {
-			logged = true
-		}
-	}
-	if !logged {
-		t.Fatal("no log line for the release before reset")
-	}
-	file, errRead := readReserveStateFile(path)
-	if errRead != nil {
-		t.Fatal(errRead)
-	}
-	if entry := file.Accounts[rig.a]["5h"]; entry.Held || entry.Utilization != 0.97 {
-		t.Fatalf("persisted 5h entry = %+v, want the reading kept and the hold cleared", entry)
+// A hold the proxy saved before a restart follows the clock after it: still held three
+// hours before its reset, released inside the final hour without a new reading.
+func TestReserveGateFinalReleasePersistedHold(t *testing.T) {
+	for name, tt := range map[string]struct {
+		resetIn  time.Duration
+		wantHeld bool
+	}{
+		"three hours before the reset: held":        {3 * time.Hour, true},
+		"thirty minutes before the reset: released": {30 * time.Minute, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			authDir := t.TempDir()
+			prefix := reserveStatePrefix()
+			reset := time.Now().Add(tt.resetIn).Unix()
+			state := fmt.Sprintf(`{"version":1,"accounts":{%q:{"7d":{"utilization":0.99,"reset_at":%d,"observed_at":%q,"held":true,"held_until":%d}}}}`,
+				prefix+"a", reset, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339), reset)
+			path := filepath.Join(authDir, internalconfig.DefaultReserveGateStateFileName)
+			if errWrite := os.WriteFile(path, []byte(state), 0o600); errWrite != nil {
+				t.Fatal(errWrite)
+			}
+			hook := logtest.NewGlobal()
+			defer hook.Reset()
+			rig := newReserveRigWithConfig(t, &EarliestResetSelector{}, false, reserveStateConfig(authDir), prefix)
+			rig.manager.Remove(WithSkipPersist(context.Background()), rig.b)
+			auth, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
+			released := false
+			for _, entry := range hook.AllEntries() {
+				if strings.Contains(entry.Message, "reserve gate: "+rig.a+" 7d window released") {
+					released = true
+				}
+			}
+			saved, errRead := readReserveStateFile(path)
+			if errRead != nil {
+				t.Fatalf("state file after the pick: %v", errRead)
+			}
+			window, kept := saved.Accounts[rig.a]["7d"]
+			if !kept || window.Utilization != 0.99 || window.ResetAt != reset {
+				t.Fatalf("saved reading = %+v (kept %v), want utilization 0.99 and reset %d kept", window, kept, reset)
+			}
+			if tt.wantHeld {
+				requireReserveHold(t, err)
+				if released || !window.Held || window.HeldUntil == 0 {
+					t.Fatalf("release logged = %v, saved hold = %+v; want no release and the hold kept", released, window)
+				}
+				return
+			}
+			if err != nil || auth.ID != rig.a {
+				t.Fatalf("pick = %v, %v; want %s released inside the final hour", auth, err, rig.a)
+			}
+			if !released {
+				t.Fatalf("no release line logged for %s", rig.a)
+			}
+			if window.Held || window.HeldUntil != 0 {
+				t.Fatalf("saved hold = %+v, want it cleared after the release", window)
+			}
+		})
 	}
 }
