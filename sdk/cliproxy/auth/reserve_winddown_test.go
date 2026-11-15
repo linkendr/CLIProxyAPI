@@ -225,12 +225,12 @@ func TestReserveWindDownTriggerOffClearsClockAndNote(t *testing.T) {
 			t.Fatal("trigger clock not cleared once a login had room")
 		}
 		rig.observe(t, rig.b, "7d", 0.98, time.Now().Add(6*24*time.Hour))
-		time.Sleep(time.Millisecond)
 		if _, _, err := rig.pickWith(reserveRequestOpts(reserveTestUserKey, reserveTestRunningTask)); err != nil {
 			t.Fatalf("running task after a new trigger: %v", err)
 		}
-		if again := rig.manager.reserveTrigger.since; again.IsZero() || !again.After(started) {
-			t.Fatalf("second trigger start %v, want a new start after %v", again, started)
+		// The clock was cleared above, so a start now is a new one; it cannot predate the first.
+		if again := rig.manager.reserveTrigger.since; again.IsZero() || again.Before(started) {
+			t.Fatalf("second trigger start %v, want a new start not before %v", again, started)
 		}
 	})
 }

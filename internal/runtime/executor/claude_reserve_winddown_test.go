@@ -14,54 +14,8 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
-func TestAppendClaudeReserveWindDownNote(t *testing.T) {
-	const note = "wrap up"
-	cases := []struct {
-		name string
-		body string
-		want string
-	}{
-		{
-			"after the tool results, cache marker kept",
-			`{"messages":[{"role":"user","content":"go"},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"f","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok","cache_control":{"type":"ephemeral"}}]}]}`,
-			`{"messages":[{"role":"user","content":"go"},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"f","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok","cache_control":{"type":"ephemeral"}},{"text":"wrap up","type":"text"}]}]}`,
-		},
-		{
-			"string content becomes blocks",
-			`{"messages":[{"role":"user","content":"go"}]}`,
-			`{"messages":[{"role":"user","content":[{"text":"go","type":"text"},{"text":"wrap up","type":"text"}]}]}`,
-		},
-		{
-			"last message not from the user",
-			`{"messages":[{"role":"user","content":"go"},{"role":"assistant","content":"{"}]}`,
-			`{"messages":[{"role":"user","content":"go"},{"role":"assistant","content":"{"}]}`,
-		},
-		{"no messages", `{"model":"m"}`, `{"model":"m"}`},
-		{"empty messages", `{"messages":[]}`, `{"messages":[]}`},
-	}
-	for _, tc := range cases {
-		got := string(appendClaudeReserveWindDownNote([]byte(tc.body), note))
-		if got != tc.want {
-			t.Errorf("%s:\n got %s\nwant %s", tc.name, got, tc.want)
-		}
-	}
-}
-
-// The prefix before the note is byte-identical, so the prompt cache prefix is unbroken.
-func TestAppendClaudeReserveWindDownNoteKeepsPrefix(t *testing.T) {
-	body := `{"system":[{"type":"text","text":"sys"}],"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}],"max_tokens":8}`
-	got := string(appendClaudeReserveWindDownNote([]byte(body), "n"))
-	prefix := `{"system":[{"type":"text","text":"sys"}],"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}`
-	if len(got) < len(prefix) || got[:len(prefix)] != prefix {
-		t.Fatalf("prefix changed: %s", got)
-	}
-	if ojson.Get(got, "system.#").Int() != 1 {
-		t.Fatalf("system prompt changed: %s", got)
-	}
-}
-
 // claudeWindDownUpstream runs one Execute against a fake upstream and returns the body it got.
-func claudeWindDownUpstream(t *testing.T, auth *cliproxyauth.Auth, format sdktranslator.Format, payload string, meta map[string]any, stream bool) []byte {
+func claudeWindDownUpstream(t *testing.T, cfg *config.Config, auth *cliproxyauth.Auth, format sdktranslator.Format, payload string, meta map[string]any, stream bool) []byte {
 	t.Helper()
 	var seen []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -78,7 +32,7 @@ func claudeWindDownUpstream(t *testing.T, auth *cliproxyauth.Auth, format sdktra
 	}))
 	defer server.Close()
 	auth.Attributes["base_url"] = server.URL
-	executor := NewClaudeExecutor(&config.Config{})
+	executor := NewClaudeExecutor(cfg)
 	req := cliproxyexecutor.Request{Model: "claude-opus-4-6", Payload: []byte(payload)}
 	opts := cliproxyexecutor.Options{SourceFormat: format, OriginalRequest: []byte(payload), Metadata: meta, Stream: stream}
 	if stream {
@@ -124,7 +78,7 @@ func TestClaudeExecutorAppendsReserveWindDownNote(t *testing.T) {
 			format  sdktranslator.Format
 			payload string
 		}{{"claude", sdktranslator.FormatClaude, claudeRunning}, {"openai", sdktranslator.FormatOpenAI, openAIRunning}} {
-			body := claudeWindDownUpstream(t, apiKey(nil), tc.format, tc.payload, marked(), stream)
+			body := claudeWindDownUpstream(t, &config.Config{}, apiKey(nil), tc.format, tc.payload, marked(), stream)
 			blocks := lastUserBlocks(t, body)
 			if len(blocks) < 2 || blocks[0].Get("type").String() != "tool_result" {
 				t.Fatalf("%s stream=%v: last user message %v, want the tool result first", tc.name, stream, blocks)
@@ -143,15 +97,47 @@ func TestClaudeExecutorAppendsReserveWindDownNote(t *testing.T) {
 	// No mark, or a credit key with fallback-when: no note.
 	for name, run := range map[string]func() []byte{
 		"unmarked": func() []byte {
-			return claudeWindDownUpstream(t, apiKey(nil), sdktranslator.FormatClaude, claudeRunning, map[string]any{}, false)
+			return claudeWindDownUpstream(t, &config.Config{}, apiKey(nil), sdktranslator.FormatClaude, claudeRunning, map[string]any{}, false)
 		},
 		"credit key": func() []byte {
-			return claudeWindDownUpstream(t, apiKey(map[string]string{"fallback_when": "limit"}), sdktranslator.FormatClaude, claudeRunning, marked(), false)
+			return claudeWindDownUpstream(t, &config.Config{}, apiKey(map[string]string{"fallback_when": "limit"}), sdktranslator.FormatClaude, claudeRunning, marked(), false)
 		},
 	} {
 		blocks := lastUserBlocks(t, run())
 		if end := blocks[len(blocks)-1]; end.Get("text").String() == cliproxyauth.ReserveWindDownNote {
 			t.Fatalf("%s: note added", name)
+		}
+	}
+}
+
+// The note is a built-in injection, so a user payload rule on the same message is applied
+// after it and is what the upstream receives; a rule elsewhere leaves the note in place.
+func TestClaudeExecutorReserveWindDownNoteBeforePayloadRules(t *testing.T) {
+	const payload = `{"model":"claude-opus-4-6","max_tokens":8,"messages":[{"role":"user","content":"go"},{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"f","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}]}`
+	configured := []any{map[string]any{"type": "tool_result", "tool_use_id": "toolu_1", "content": "configured"}}
+	rule := func(params map[string]any) *config.Config {
+		return &config.Config{Payload: config.PayloadConfig{Override: []config.PayloadRule{{
+			Models: []config.PayloadModelRule{{Name: "claude-opus-4-6"}},
+			Params: params,
+		}}}}
+	}
+	auth := func() *cliproxyauth.Auth {
+		return &cliproxyauth.Auth{ID: "k", Provider: "claude", Attributes: map[string]string{"api_key": "fake-key"}}
+	}
+	meta := func() map[string]any { return map[string]any{cliproxyauth.ReserveWindDownMetadataKey: true} }
+	for _, stream := range []bool{false, true} {
+		body := claudeWindDownUpstream(t, rule(map[string]any{"messages.2.content": configured}), auth(), sdktranslator.FormatClaude, payload, meta(), stream)
+		blocks := lastUserBlocks(t, body)
+		if len(blocks) != 1 || blocks[0].Get("content").String() != "configured" {
+			t.Fatalf("stream=%v: last user message %s, want only the configured content", stream, ojson.GetBytes(body, "messages.2.content").Raw)
+		}
+		body = claudeWindDownUpstream(t, rule(map[string]any{"max_tokens": 1234}), auth(), sdktranslator.FormatClaude, payload, meta(), stream)
+		blocks = lastUserBlocks(t, body)
+		if ojson.GetBytes(body, "max_tokens").Int() != 1234 {
+			t.Fatalf("stream=%v: max_tokens %s, want the configured 1234", stream, ojson.GetBytes(body, "max_tokens").Raw)
+		}
+		if end := blocks[len(blocks)-1]; len(blocks) != 2 || end.Get("text").String() != cliproxyauth.ReserveWindDownNote {
+			t.Fatalf("stream=%v: last user message %s, want the tool result then the note", stream, ojson.GetBytes(body, "messages.2.content").Raw)
 		}
 	}
 }

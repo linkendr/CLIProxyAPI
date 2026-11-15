@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 )
 
 // The release before a reset is final-release-hours now (it replaced release-before-reset):
@@ -94,15 +96,40 @@ func TestReserveGateFinalReleasePersistedHold(t *testing.T) {
 			if errWrite := os.WriteFile(path, []byte(state), 0o600); errWrite != nil {
 				t.Fatal(errWrite)
 			}
+			hook := logtest.NewGlobal()
+			defer hook.Reset()
 			rig := newReserveRigWithConfig(t, &EarliestResetSelector{}, false, reserveStateConfig(authDir), prefix)
 			rig.manager.Remove(WithSkipPersist(context.Background()), rig.b)
 			auth, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
+			released := false
+			for _, entry := range hook.AllEntries() {
+				if strings.Contains(entry.Message, "reserve gate: "+rig.a+" 7d window released") {
+					released = true
+				}
+			}
+			saved, errRead := readReserveStateFile(path)
+			if errRead != nil {
+				t.Fatalf("state file after the pick: %v", errRead)
+			}
+			window, kept := saved.Accounts[rig.a]["7d"]
+			if !kept || window.Utilization != 0.99 || window.ResetAt != reset {
+				t.Fatalf("saved reading = %+v (kept %v), want utilization 0.99 and reset %d kept", window, kept, reset)
+			}
 			if tt.wantHeld {
 				requireReserveHold(t, err)
+				if released || !window.Held || window.HeldUntil == 0 {
+					t.Fatalf("release logged = %v, saved hold = %+v; want no release and the hold kept", released, window)
+				}
 				return
 			}
 			if err != nil || auth.ID != rig.a {
 				t.Fatalf("pick = %v, %v; want %s released inside the final hour", auth, err, rig.a)
+			}
+			if !released {
+				t.Fatalf("no release line logged for %s", rig.a)
+			}
+			if window.Held || window.HeldUntil != 0 {
+				t.Fatalf("saved hold = %+v, want it cleared after the release", window)
 			}
 		})
 	}
