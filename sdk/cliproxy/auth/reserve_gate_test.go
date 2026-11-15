@@ -262,15 +262,14 @@ func requireRetryAfterNear(t *testing.T, err error, reset time.Time) {
 	requireRefusalCountdownNear(t, err.Error(), reset)
 }
 
-// t3ResetAfterPattern is the expression T3 Code 0.1.9 reads the reset of a refused turn
-// with (gatewayCooldownResetAt).
-var t3ResetAfterPattern = regexp.MustCompile(`\(reset after (?:(\d+)h ?)?(?:(\d+)m ?)?(?:(\d+)s)?\)`)
+// resetAfterPattern reads the countdown at the end of a refusal message.
+var resetAfterPattern = regexp.MustCompile(`\(reset after (?:(\d+)h ?)?(?:(\d+)m ?)?(?:(\d+)s)?\)`)
 
-// requireRefusalCountdownNear checks that message carries the countdown T3 Code parses
+// requireRefusalCountdownNear checks that message carries the countdown
 // and that it ends at reset.
 func requireRefusalCountdownNear(t *testing.T, message string, reset time.Time) {
 	t.Helper()
-	match := t3ResetAfterPattern.FindStringSubmatch(message)
+	match := resetAfterPattern.FindStringSubmatch(message)
 	if match == nil {
 		t.Fatalf("message %s has no (reset after ...) countdown", message)
 	}

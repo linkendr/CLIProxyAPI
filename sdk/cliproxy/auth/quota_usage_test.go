@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -175,6 +176,10 @@ func TestParseQuotaUsage(t *testing.T) {
 		"limits not an array":       `{"seven_day": {"utilization": 4}, "limits": {"kind": "weekly_all"}}`,
 		"limit not an object":       `{"seven_day": {"utilization": 4}, "limits": [4]}`,
 		"percent not a number":      `{"seven_day": {"utilization": 4}, "limits": [{"kind": "weekly_scoped", "percent": "4"}]}`,
+		"malformed five-hour reset": `{"seven_day": {"utilization": 4}, "five_hour": {"utilization": 10, "resets_at": "tomorrow"}}`,
+		"malformed scoped reset":    `{"seven_day": {"utilization": 4}, "limits": [{"kind": "weekly_scoped", "percent": 10, "resets_at": "tomorrow"}]}`,
+		"malformed unused reset":    `{"seven_day": {"utilization": 4}, "limits": [{"kind": "weekly_all", "percent": 4, "resets_at": "tomorrow"}]}`,
+		"reset without a percent":   `{"seven_day": {"utilization": 4}, "five_hour": {"utilization": null, "resets_at": 5}}`,
 	} {
 		if _, errParse := parseQuotaUsage([]byte(body)); errParse == nil {
 			t.Errorf("%s: parsed without error", name)
@@ -685,6 +690,57 @@ func TestQuotaUsageLiftsOnlyTheLimitWithRoom(t *testing.T) {
 			rig.manager.applyQuotaUsage(context.Background(), rig.a, tc.report, time.Now())
 			if got := !rig.cooled(rig.a); got != tc.lifted {
 				t.Fatalf("cooldown lifted = %v, want %v", got, tc.lifted)
+			}
+		})
+	}
+}
+
+// A body that reports room but carries a reset that is not a time, in any window the
+// proxy knows, lifts no cooldown. The same body with valid resets lifts it.
+func TestQuotaUsageMalformedResetKeepsCooldown(t *testing.T) {
+	rejection := func(window string) http.Header {
+		headers := unifiedHeaders(map[string]float64{"7d": 0.40}, time.Now().Add(48*time.Hour))
+		headers.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		headers.Set("Anthropic-Ratelimit-Unified-"+window+"-Status", "rejected")
+		return headers
+	}
+	fiveHourLimit := func(t *testing.T, rig *reserveRig, id string) { rig.limitWith(t, id, rejection("5h")) }
+	modelLimit := func(t *testing.T, rig *reserveRig, id string) { rig.limitModel(t, id, rejection("7d_oi")) }
+	const valid, malformed = "2099-01-01T00:00:00Z", "tomorrow"
+	for name, tc := range map[string]struct {
+		cool             func(t *testing.T, rig *reserveRig, id string)
+		fiveHour, scoped string
+		lifted           bool
+	}{
+		"5-hour limit, valid resets":           {fiveHourLimit, valid, valid, true},
+		"5-hour limit, malformed 5-hour reset": {fiveHourLimit, malformed, valid, false},
+		"5-hour limit, malformed scoped reset": {fiveHourLimit, valid, malformed, false},
+		"model limit, valid resets":            {modelLimit, valid, valid, true},
+		"model limit, malformed scoped reset":  {modelLimit, valid, malformed, false},
+		"model limit, malformed 5-hour reset":  {modelLimit, malformed, valid, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rig := newReserveRig(t, &RoundRobinSelector{}, true, reserveGateOn(nil))
+			tc.cool(t, rig, rig.a)
+			tc.cool(t, rig, rig.b)
+			requests := rig.serveUsage(t, fmt.Sprintf(`{
+				"seven_day": {"utilization": 40, "resets_at": %q},
+				"five_hour": {"utilization": 10, "resets_at": %q},
+				"limits": [{"kind": "weekly_scoped", "percent": 30, "resets_at": %q}]}`, valid, tc.fiveHour, tc.scoped))
+
+			auth, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
+			if requests.Load() == 0 {
+				t.Fatal("no usage read before the fallback")
+			}
+			if tc.lifted {
+				requireMaxLogin(t, rig, auth, err)
+				return
+			}
+			if err != nil || auth.ID != rig.credit {
+				t.Fatalf("pick = %v, %v; want the credit key, as without a read", auth, err)
+			}
+			if !rig.cooled(rig.a) || !rig.cooled(rig.b) {
+				t.Fatal("a body with a malformed reset cleared a cooldown")
 			}
 		})
 	}

@@ -46,7 +46,7 @@ func TestCreditKeyResponseCarriesMaxPoolHeaders(t *testing.T) {
 				"Reset":                strconv.FormatInt(early.Unix(), 10),
 				"7d-Utilization":       "1",
 				"7d-Reset":             strconv.FormatInt(early.Unix(), 10),
-				// No window status: Claude Code reads "rejected" there as a limit event.
+				// No window status: a served response carries no "rejected" anywhere.
 				"7d-Status": "",
 				"5h-Status": "",
 			}

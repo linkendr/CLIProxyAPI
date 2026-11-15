@@ -39,9 +39,9 @@ func TestQuotaRefusalSentence(t *testing.T) {
 	}
 }
 
-// T3 Code derives resetAt of a failed turn from this countdown and nothing else, with
-// the pattern below (t3ResetAfterPattern is the one T3 0.1.9 uses).
-func TestQuotaRefusalCountdownMatchesT3Pattern(t *testing.T) {
+// A client that parses the countdown with resetAfterPattern reads the time left, rounded
+// up to a second.
+func TestQuotaRefusalCountdownMatchesResetAfterPattern(t *testing.T) {
 	now := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		left time.Duration
@@ -59,9 +59,9 @@ func TestQuotaRefusalCountdownMatchesT3Pattern(t *testing.T) {
 			t.Errorf("countdown(%s) = %q, want %q", tc.left, got, tc.want)
 			continue
 		}
-		match := t3ResetAfterPattern.FindStringSubmatch("Weekly limit." + got)
+		match := resetAfterPattern.FindStringSubmatch("Weekly limit." + got)
 		if match == nil {
-			t.Errorf("countdown %q does not match T3's pattern", got)
+			t.Errorf("countdown %q does not match resetAfterPattern", got)
 			continue
 		}
 		hours, _ := strconv.Atoi(match[1])
@@ -69,7 +69,7 @@ func TestQuotaRefusalCountdownMatchesT3Pattern(t *testing.T) {
 		seconds, _ := strconv.Atoi(match[3])
 		read := time.Duration(hours)*time.Hour + time.Duration(minutes)*time.Minute + time.Duration(seconds)*time.Second
 		if wantRead := max(tc.left, 0); read < wantRead || read >= wantRead+time.Second+time.Nanosecond {
-			t.Errorf("T3 reads %s from %q, want %s rounded up to a second", read, got, tc.left)
+			t.Errorf("the pattern reads %s from %q, want %s rounded up to a second", read, got, tc.left)
 		}
 	}
 	if got := quotaRefusalCountdown(time.Time{}, now); got != "" {
@@ -101,8 +101,8 @@ func TestQuotaLimitFromSignals(t *testing.T) {
 }
 
 // A cooldown refusal names the limit that cooled the Max login and its reset in local
-// time, ends with the countdown T3 reads, and carries the headers Claude Code turns
-// into a rate_limit_event with resetsAt.
+// time, ends with the countdown, and carries the unified headers with the reset and the
+// limit's claim.
 func TestCooldownRefusalNamesLimitAndReset(t *testing.T) {
 	const prefix = "Anthropic-Ratelimit-Unified-"
 	reset := time.Now().Add(100 * time.Hour).Truncate(time.Second)

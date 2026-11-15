@@ -711,10 +711,9 @@ func (e *reserveHoldError) StatusCode() int { return http.StatusTooManyRequests 
 
 func (e *reserveHoldError) IsRequestStop() bool { return true }
 
-// Headers returns Retry-After and the unified rate-limit headers a Claude Code session
-// with a subscription login reads to show when the limit resets: it reports the reset
-// and the limit type only when the representative claim is present. A manual hold has
-// no reset, so it sends none.
+// Headers returns Retry-After and the unified rate-limit headers that say when the limit
+// resets and which limit it is (the representative claim). A manual hold has no reset,
+// so it sends none.
 func (e *reserveHoldError) Headers() http.Header {
 	if e.resetAt.IsZero() {
 		return nil

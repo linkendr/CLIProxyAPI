@@ -12,8 +12,8 @@ import (
 // reset of the Max login with the most room, a login at a real limit counting as full.
 // Anthropic sends these headers only for a subscription login, so a client that meters
 // the weekly limit from them would otherwise keep its last value while a credit key
-// serves. The status is always "allowed": the response was served, and Claude Code
-// treats any other status as a limit event. Headers of another credential, headers
+// serves. The status is always "allowed": the response was served, and no other status
+// may make it read as a limit event. Headers of another credential, headers
 // that already carry a unified status, and a pool with no known reset are returned
 // unchanged. Clients receive response headers only with passthrough-headers.
 func (m *Manager) withMaxPoolHeaders(auth *Auth, headers http.Header, now time.Time) http.Header {

@@ -37,7 +37,7 @@ LIMIT_RETRY_SECONDS = 11
 USAGE_PATH = "/api/oauth/usage?cedar_ember=1&skip_spend=1"
 USAGE_BETA = "oauth-2025-04-20"
 USAGE_READ_SECONDS = 60  # the proxy reads one login's usage at most once in this time
-# The pattern T3 Code 0.1.9 reads the reset time of a refusal from.
+# The countdown at the end of a refusal message.
 RESET_AFTER = re.compile(r"\(reset after (?:(\d+)h ?)?(?:(\d+)m ?)?(?:(\d+)s)?\)")
 HOUR = 3600
 DAY = 24 * HOUR

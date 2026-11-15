@@ -45,9 +45,8 @@ func quotaRefusalSentence(limit string, at time.Time, zone *time.Location) strin
 }
 
 // quotaRefusalCountdown is the suffix " (reset after 3h 4m 5s)" of a refusal message.
-// T3 Code reads the reset time of a 429 from this text: Claude Code run with a gateway
-// token ignores the unified rate-limit headers. Hours are not folded into days. It is
-// empty when the reset is unknown.
+// It carries the reset for a client that does not read the unified rate-limit headers.
+// Hours are not folded into days. It is empty when the reset is unknown.
 func quotaRefusalCountdown(at, now time.Time) string {
 	if at.IsZero() {
 		return ""
@@ -60,8 +59,7 @@ func quotaRefusalCountdown(at, now time.Time) string {
 }
 
 // quotaRefusalClaim is the anthropic-ratelimit-unified-representative-claim value of a
-// refusal. A Claude Code session with a subscription login names the limit of a 429
-// and its reset only when this header (or the overage status) is present. Empty for an
+// refusal: it names the limit to a client that reads the unified headers. Empty for an
 // unknown limit.
 func quotaRefusalClaim(limit string) string {
 	switch limit {

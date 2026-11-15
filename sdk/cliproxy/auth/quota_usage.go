@@ -45,9 +45,10 @@ type quotaUsageReport struct {
 }
 
 // parseQuotaUsage reads the usage body: seven_day.utilization in percent (73.0 is 73%),
-// and limits[] with kind weekly_all and weekly_scoped. A body without a weekly all-model
-// value is an error, and so is a value of the wrong type or a reset time that does not
-// parse, so the caller changes nothing. A key that is absent or null is not known.
+// five_hour, and limits[] with kind weekly_all and weekly_scoped. A body without a weekly
+// all-model value is an error, and so is a value of the wrong type or a reset that is not
+// a time in any of these windows, used or not, so the caller changes nothing. A key that
+// is absent or null is not known.
 func parseQuotaUsage(data []byte) (quotaUsageReport, error) {
 	if !ojson.ValidBytes(data) {
 		return quotaUsageReport{}, errors.New("parse usage: body is not JSON")
@@ -57,16 +58,12 @@ func parseQuotaUsage(data []byte) (quotaUsageReport, error) {
 		return quotaUsageReport{}, errors.New("parse usage: body is not a JSON object")
 	}
 	var report quotaUsageReport
-	weekly, found, errWeekly := quotaUsagePercent(body, "seven_day", "utilization")
+	weekly, found, weeklyReset, errWeekly := quotaUsageWindow(body, "seven_day", "utilization")
 	if errWeekly != nil {
 		return quotaUsageReport{}, errWeekly
 	}
 	if found {
-		reset, errReset := quotaUsageTime(body.Get("seven_day.resets_at"), "seven_day.resets_at")
-		if errReset != nil {
-			return quotaUsageReport{}, errReset
-		}
-		report.weeklyAll, report.weeklyReset = weekly, reset
+		report.weeklyAll, report.weeklyReset = weekly, weeklyReset
 	}
 	limits := body.Get("limits")
 	if limits.Exists() && limits.Type != ojson.Null && !limits.IsArray() {
@@ -77,20 +74,20 @@ func parseQuotaUsage(data []byte) (quotaUsageReport, error) {
 		if !limit.IsObject() {
 			return quotaUsageReport{}, fmt.Errorf("parse usage: %s is not an object", name)
 		}
-		fraction, known, errPercent := quotaUsageNumber(limit.Get("percent"), name+".percent")
-		if errPercent != nil {
-			return quotaUsageReport{}, errPercent
+		kind := limit.Get("kind").String()
+		if kind != quotaLimitWeeklyAll && kind != quotaLimitWeeklyScoped {
+			continue
+		}
+		fraction, known, reset, errLimit := quotaUsageWindow(body, name, "percent")
+		if errLimit != nil {
+			return quotaUsageReport{}, errLimit
 		}
 		if !known {
 			continue
 		}
-		switch limit.Get("kind").String() {
+		switch kind {
 		case quotaLimitWeeklyAll:
 			if !found {
-				reset, errReset := quotaUsageTime(limit.Get("resets_at"), name+".resets_at")
-				if errReset != nil {
-					return quotaUsageReport{}, errReset
-				}
 				report.weeklyAll, report.weeklyReset, found = fraction, reset, true
 			}
 		case quotaLimitWeeklyScoped:
@@ -102,7 +99,7 @@ func parseQuotaUsage(data []byte) (quotaUsageReport, error) {
 	if !found {
 		return quotaUsageReport{}, errors.New("parse usage: no weekly all-model utilization")
 	}
-	fiveHour, fiveHourKnown, errFiveHour := quotaUsagePercent(body, "five_hour", "utilization")
+	fiveHour, fiveHourKnown, _, errFiveHour := quotaUsageWindow(body, "five_hour", "utilization")
 	if errFiveHour != nil {
 		return quotaUsageReport{}, errFiveHour
 	}
@@ -110,17 +107,26 @@ func parseQuotaUsage(data []byte) (quotaUsageReport, error) {
 	return report, nil
 }
 
-// quotaUsagePercent reads the percent key of the window object as a fraction. A window
-// that is absent or null is not known; a window that is not an object is an error.
-func quotaUsagePercent(body ojson.Result, window, key string) (float64, bool, error) {
+// quotaUsageWindow reads the percent key of the window object as a fraction, and its
+// reset. A window that is absent or null is not known. A window that is not an object,
+// or whose percent or reset has the wrong form, is an error, with or without a percent.
+func quotaUsageWindow(body ojson.Result, window, key string) (float64, bool, time.Time, error) {
 	object := body.Get(window)
 	if !object.Exists() || object.Type == ojson.Null {
-		return 0, false, nil
+		return 0, false, time.Time{}, nil
 	}
 	if !object.IsObject() {
-		return 0, false, fmt.Errorf("parse usage: %s is not an object", window)
+		return 0, false, time.Time{}, fmt.Errorf("parse usage: %s is not an object", window)
 	}
-	return quotaUsageNumber(object.Get(key), window+"."+key)
+	fraction, known, errNumber := quotaUsageNumber(object.Get(key), window+"."+key)
+	if errNumber != nil {
+		return 0, false, time.Time{}, errNumber
+	}
+	reset, errReset := quotaUsageTime(object.Get("resets_at"), window+".resets_at")
+	if errReset != nil {
+		return 0, false, time.Time{}, errReset
+	}
+	return fraction, known, reset, nil
 }
 
 // quotaUsageNumber reads a percent as a fraction. Absent or null is not known; any other

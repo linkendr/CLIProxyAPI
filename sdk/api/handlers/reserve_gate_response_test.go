@@ -99,7 +99,7 @@ func TestReserveGateHoldReachesClientAs429(t *testing.T) {
 	if body.Error.Type != "rate_limit_error" || !strings.HasPrefix(body.Error.Message, "Quota reserve hold:") || !strings.Contains(body.Error.Message, "Next release "+release+".") {
 		t.Fatalf("body = %s, want rate_limit_error naming the hold and its release in local time (%s)", recorder.Body.String(), release)
 	}
-	// T3 Code reads the reset of the refused turn from this countdown.
+	// The message ends with the countdown to the release.
 	if !regexp.MustCompile(`\(reset after (1h 59m \d+s|2h 0m 0s)\)$`).MatchString(body.Error.Message) {
 		t.Fatalf("message %q does not end with the countdown to the release", body.Error.Message)
 	}
