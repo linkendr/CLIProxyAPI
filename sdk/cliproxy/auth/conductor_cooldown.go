@@ -1067,13 +1067,14 @@ func dedupeStrings(values []string) []string {
 // reading: both describe the window before the reset, and a stale reading would keep
 // the login held.
 func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []string, error) {
-	return m.resetQuotaIf(ctx, authID, nil)
+	return m.resetQuotaIf(ctx, authID, nil, time.Time{})
 }
 
 // resetQuotaIf is ResetQuota with a condition that is checked under m.mu, in the same
 // critical section as the reset, so a cooldown recorded after the caller looked is not
-// cleared. A nil due always resets. A reset that due refuses returns no auth.
-func (m *Manager) resetQuotaIf(ctx context.Context, authID string, due func(auth *Auth) bool) (*Auth, []string, error) {
+// cleared. A nil due always resets. A reset that due refuses returns no auth. A reserve
+// reading observed after keepAfter survives the reset (zero keeps none).
+func (m *Manager) resetQuotaIf(ctx context.Context, authID string, due func(auth *Auth) bool, keepAfter time.Time) (*Auth, []string, error) {
 	if m == nil {
 		return nil, nil, nil
 	}
@@ -1153,7 +1154,7 @@ func (m *Manager) resetQuotaIf(ctx context.Context, authID string, due func(auth
 	releaseMutation()
 
 	if dropReserveReading {
-		m.reserveHolds.drop(authID, now)
+		m.reserveHolds.drop(authID, keepAfter, now)
 		if gate := m.reserveGate.Load(); gate != nil {
 			m.observeReserveTrigger(gate, now)
 		}

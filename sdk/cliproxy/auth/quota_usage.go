@@ -407,7 +407,8 @@ func (r quotaUsageReport) checkAt(at time.Time) error {
 // applyQuotaUsage applies a usage read to one login: when every limit that cools the
 // login has room again it clears the cooldown, and the weekly reading replaces the
 // login's reserve reading. started is the state at the start of the read; the reading is
-// dated there, so a header reading that arrived during the read stays the newer one. The
+// dated there, so a header reading that arrived during the read stays the newer one,
+// also across the lift. The
 // lift is the reset the owner can run by hand (ResetQuota): it clears every cooldown of
 // the login, also one that has another cause than quota. It reports whether that lifted
 // a cooldown or changed the reading, so a new selection can differ. The caller must not
@@ -423,7 +424,7 @@ func (m *Manager) applyQuotaUsage(ctx context.Context, authID string, report quo
 	}
 	reset, _, errReset := m.resetQuotaIf(ctx, authID, func(auth *Auth) bool {
 		return quotaUsageLiftsCooldown(auth, report, started, now)
-	})
+	}, started.at)
 	lift := errReset == nil && reset != nil
 	switch {
 	case errReset != nil:

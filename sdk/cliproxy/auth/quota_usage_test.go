@@ -19,7 +19,8 @@ import (
 
 // quotaUsageFake stands in for Anthropic's usage endpoint: a report or an error per
 // login, a count of the reads, and the clock the read limit runs on. The clock starts at
-// the real time, so a usage reading is never older than a header reading of the test.
+// the real time and stands still. A read is as old as that clock says: a response the
+// test records after the install is newer than a read, until the test advances the clock.
 type quotaUsageFake struct {
 	mu      sync.Mutex
 	now     time.Time
@@ -742,8 +743,11 @@ func TestQuotaUsageLimitDuringReadKeepsCooldown(t *testing.T) {
 		rig.limitAt(t, rig.a, time.Now().Add(48*time.Hour).Truncate(time.Second))
 		during := time.Now().Add(160 * time.Hour).Truncate(time.Second)
 		usage.report(0.02, during, rig.a)
+		// The clock moves on during the read: a reading dated at the end of the read would
+		// be newer than the 429 and replace its reading.
 		rig.manager.quotaUsage.read = func(ctx context.Context, auth *Auth) (quotaUsageReport, error) {
 			rig.limitAt(t, auth.ID, during)
+			usage.advance(time.Hour)
 			return usage.read(ctx, auth)
 		}
 
@@ -765,6 +769,35 @@ func TestQuotaUsageLimitDuringReadKeepsCooldown(t *testing.T) {
 		auth, err := rig.pick(reserveTestExemptKey, "", reserveTestClaudeModel)
 		if err != nil || auth.ID != rig.a {
 			t.Fatalf("pick after an undisturbed read = %v, %v; want %s", auth, err, rig.a)
+		}
+	})
+}
+
+// A request that began before the 429 can end well during the usage read. Its reading is
+// newer than the report, so it stays the reading of the login when the report lifts the
+// cooldown.
+func TestQuotaUsageLiftKeepsReadingFromDuringRead(t *testing.T) {
+	forEachQuotaRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig, usage *quotaUsageFake) {
+		rig.disable(t, rig.b)
+		rig.disable(t, rig.credit)
+		reset := time.Now().Add(48 * time.Hour).Truncate(time.Second)
+		rig.limitAt(t, rig.a, reset)
+		usage.report(0.90, reset, rig.a)
+		rig.manager.quotaUsage.read = func(ctx context.Context, auth *Auth) (quotaUsageReport, error) {
+			late := internallogging.WithResponseHeadersHolder(context.Background())
+			internallogging.SetResponseHeaders(late, unifiedHeaders(map[string]float64{"7d": 0.93}, reset))
+			rig.manager.MarkResult(late, Result{AuthID: auth.ID, Provider: "claude", Model: "claude-late-model", Success: true})
+			usage.advance(time.Hour)
+			return usage.read(ctx, auth)
+		}
+
+		auth, err := rig.pick(reserveTestExemptKey, "", reserveTestClaudeModel)
+		if err != nil || auth.ID != rig.a {
+			t.Fatalf("pick = %v, %v; want %s after the lift", auth, err, rig.a)
+		}
+		reading, ok := rig.manager.reserveHolds.reading(rig.a, "7d")
+		if !ok || reading.utilization != 0.93 || reading.source == reserveReadingFromUsage {
+			t.Fatalf("book reading = %+v, %v; want the 0.93 of the response that ended during the read", reading, ok)
 		}
 	})
 }
@@ -931,14 +964,14 @@ func TestResetQuotaIfRefusedKeepsCooldown(t *testing.T) {
 	auth, _, err := rig.manager.resetQuotaIf(context.Background(), rig.a, func(auth *Auth) bool {
 		seen = auth.ID == rig.a && reserveAtRealLimit(auth, time.Now())
 		return false
-	})
+	}, time.Time{})
 	if err != nil || auth != nil || !seen {
 		t.Fatalf("refused reset = %v, %v, saw the cooled login = %v; want no auth, no error, true", auth, err, seen)
 	}
 	if after, ok := rig.manager.reserveHolds.reading(rig.a, "7d"); !rig.cooled(rig.a) || !ok || after != before {
 		t.Fatalf("after a refused reset: cooled = %v, reading = %+v, %v; want the cooldown and %+v", rig.cooled(rig.a), after, ok, before)
 	}
-	auth, _, err = rig.manager.resetQuotaIf(context.Background(), rig.a, func(*Auth) bool { return true })
+	auth, _, err = rig.manager.resetQuotaIf(context.Background(), rig.a, func(*Auth) bool { return true }, time.Time{})
 	if err != nil || auth == nil || rig.cooled(rig.a) {
 		t.Fatalf("allowed reset = %v, %v, cooled = %v; want the login without a cooldown", auth, err, rig.cooled(rig.a))
 	}

@@ -307,14 +307,16 @@ func (b *reserveHoldBook) reading(authID, window string) (reserveReading, bool) 
 	return reading, ok
 }
 
-// drop forgets every reading and hold of one account and writes the change to the state
-// file. A quota reset uses it: the readings describe the window before the reset.
-func (b *reserveHoldBook) drop(authID string, now time.Time) {
+// drop forgets the readings and holds of one account and writes the change to the state
+// file. A quota reset uses it: the readings describe the window before the reset. A
+// reading observed after keepAfter stays (zero keeps none): a reset that acts on a usage
+// report must not forget what a response said after the report was asked for.
+func (b *reserveHoldBook) drop(authID string, keepAfter, now time.Time) {
 	b.mu.Lock()
 	dropped := false
 	for _, window := range reserveWindows {
 		key := reserveKey{authID: authID, window: window}
-		if _, ok := b.readings[key]; ok {
+		if reading, ok := b.readings[key]; ok && (keepAfter.IsZero() || !reading.observedAt.After(keepAfter)) {
 			delete(b.readings, key)
 			dropped = true
 		}

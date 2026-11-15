@@ -323,9 +323,10 @@ func TestQuotaStateRoutes(t *testing.T) {
 func TestQuotaStateReadings(t *testing.T) {
 	path := quotaStateTestFile(t)
 	rig := newReserveRig(t, &RoundRobinSelector{}, true, reserveGateOn(nil))
-	usage := installQuotaUsageFake(rig)
 	rig.limitAt(t, rig.a, time.Now().Add(48*time.Hour))
 	rig.observe(t, rig.b, "7d", 0.60, time.Now().Add(-time.Minute))
+	// The usage clock starts after the 429, as a read that follows it does.
+	usage := installQuotaUsageFake(rig)
 	rig.manager.syncQuotaState(time.Now())
 	doc, _ := readQuotaStateFile(t, path)
 	if login := loginOf(t, doc, rig.index(rig.b)); login.Utilization != nil || login.ResetsAt != nil || login.ReadFrom != "" {
