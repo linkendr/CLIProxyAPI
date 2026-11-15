@@ -25,7 +25,8 @@ func quotaStateTestFile(t *testing.T) string {
 }
 
 // readQuotaStateFile reads the file as a reader of the contract does: every field of
-// the schema, and none besides.
+// the schema, and none besides. It decodes with the standard library on purpose: the
+// readers are not this proxy, and ojson has no decoder that rejects unknown fields.
 func readQuotaStateFile(t *testing.T, path string) (quotaStateDoc, string) {
 	t.Helper()
 	data, err := os.ReadFile(path)

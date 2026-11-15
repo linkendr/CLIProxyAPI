@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -44,73 +44,115 @@ type quotaUsageReport struct {
 	fiveHourKnown bool
 }
 
-type quotaUsageWindowBody struct {
-	Utilization *float64 `json:"utilization"`
-	ResetsAt    string   `json:"resets_at"`
-}
-
-type quotaUsageBody struct {
-	FiveHour *quotaUsageWindowBody `json:"five_hour"`
-	SevenDay *quotaUsageWindowBody `json:"seven_day"`
-	Limits   []struct {
-		Kind     string   `json:"kind"`
-		Percent  *float64 `json:"percent"`
-		ResetsAt string   `json:"resets_at"`
-	} `json:"limits"`
-}
-
 // parseQuotaUsage reads the usage body: seven_day.utilization in percent (73.0 is 73%),
 // and limits[] with kind weekly_all and weekly_scoped. A body without a weekly all-model
-// value is an error, so the caller changes nothing.
+// value is an error, and so is a value of the wrong type or a reset time that does not
+// parse, so the caller changes nothing. A key that is absent or null is not known.
 func parseQuotaUsage(data []byte) (quotaUsageReport, error) {
-	var body quotaUsageBody
-	if errJSON := json.Unmarshal(data, &body); errJSON != nil {
-		return quotaUsageReport{}, fmt.Errorf("parse usage: %w", errJSON)
+	if !ojson.ValidBytes(data) {
+		return quotaUsageReport{}, errors.New("parse usage: body is not JSON")
+	}
+	body := ojson.ParseBytes(data)
+	if !body.IsObject() {
+		return quotaUsageReport{}, errors.New("parse usage: body is not a JSON object")
 	}
 	var report quotaUsageReport
-	found := false
-	if body.SevenDay != nil && body.SevenDay.Utilization != nil {
-		report.weeklyAll, found = *body.SevenDay.Utilization/100, true
-		report.weeklyReset = parseQuotaUsageTime(body.SevenDay.ResetsAt)
+	weekly, found, errWeekly := quotaUsagePercent(body, "seven_day", "utilization")
+	if errWeekly != nil {
+		return quotaUsageReport{}, errWeekly
 	}
-	for _, limit := range body.Limits {
-		if limit.Percent == nil {
+	if found {
+		reset, errReset := quotaUsageTime(body.Get("seven_day.resets_at"), "seven_day.resets_at")
+		if errReset != nil {
+			return quotaUsageReport{}, errReset
+		}
+		report.weeklyAll, report.weeklyReset = weekly, reset
+	}
+	limits := body.Get("limits")
+	if limits.Exists() && limits.Type != ojson.Null && !limits.IsArray() {
+		return quotaUsageReport{}, errors.New("parse usage: limits is not an array")
+	}
+	for i, limit := range limits.Array() {
+		name := fmt.Sprintf("limits.%d", i)
+		if !limit.IsObject() {
+			return quotaUsageReport{}, fmt.Errorf("parse usage: %s is not an object", name)
+		}
+		fraction, known, errPercent := quotaUsageNumber(limit.Get("percent"), name+".percent")
+		if errPercent != nil {
+			return quotaUsageReport{}, errPercent
+		}
+		if !known {
 			continue
 		}
-		fraction := *limit.Percent / 100
-		switch limit.Kind {
+		switch limit.Get("kind").String() {
 		case quotaLimitWeeklyAll:
 			if !found {
-				report.weeklyAll, found = fraction, true
-				report.weeklyReset = parseQuotaUsageTime(limit.ResetsAt)
+				reset, errReset := quotaUsageTime(limit.Get("resets_at"), name+".resets_at")
+				if errReset != nil {
+					return quotaUsageReport{}, errReset
+				}
+				report.weeklyAll, report.weeklyReset, found = fraction, reset, true
 			}
 		case quotaLimitWeeklyScoped:
-			if validQuotaFraction(fraction) && (!report.scopedKnown || fraction > report.weeklyScoped) {
+			if !report.scopedKnown || fraction > report.weeklyScoped {
 				report.weeklyScoped, report.scopedKnown = fraction, true
 			}
 		}
 	}
-	if !found || !validQuotaFraction(report.weeklyAll) {
+	if !found {
 		return quotaUsageReport{}, errors.New("parse usage: no weekly all-model utilization")
 	}
-	if body.FiveHour != nil && body.FiveHour.Utilization != nil {
-		if fraction := *body.FiveHour.Utilization / 100; validQuotaFraction(fraction) {
-			report.fiveHour, report.fiveHourKnown = fraction, true
-		}
+	fiveHour, fiveHourKnown, errFiveHour := quotaUsagePercent(body, "five_hour", "utilization")
+	if errFiveHour != nil {
+		return quotaUsageReport{}, errFiveHour
 	}
+	report.fiveHour, report.fiveHourKnown = fiveHour, fiveHourKnown
 	return report, nil
 }
 
-func validQuotaFraction(value float64) bool {
-	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= 0
+// quotaUsagePercent reads the percent key of the window object as a fraction. A window
+// that is absent or null is not known; a window that is not an object is an error.
+func quotaUsagePercent(body ojson.Result, window, key string) (float64, bool, error) {
+	object := body.Get(window)
+	if !object.Exists() || object.Type == ojson.Null {
+		return 0, false, nil
+	}
+	if !object.IsObject() {
+		return 0, false, fmt.Errorf("parse usage: %s is not an object", window)
+	}
+	return quotaUsageNumber(object.Get(key), window+"."+key)
 }
 
-func parseQuotaUsageTime(value string) time.Time {
-	parsed, errParse := time.Parse(time.RFC3339, strings.TrimSpace(value))
-	if errParse != nil {
-		return time.Time{}
+// quotaUsageNumber reads a percent as a fraction. Absent or null is not known; any other
+// value that is not a number of 0 or more is an error.
+func quotaUsageNumber(value ojson.Result, name string) (float64, bool, error) {
+	if !value.Exists() || value.Type == ojson.Null {
+		return 0, false, nil
 	}
-	return parsed.Truncate(time.Second)
+	if value.Type != ojson.Number {
+		return 0, false, fmt.Errorf("parse usage: %s is not a number", name)
+	}
+	fraction := value.Float() / 100
+	if math.IsNaN(fraction) || math.IsInf(fraction, 0) || fraction < 0 {
+		return 0, false, fmt.Errorf("parse usage: %s is out of range", name)
+	}
+	return fraction, true, nil
+}
+
+// quotaUsageTime reads a reset time. Absent or null is the zero time (a fresh window has
+// no reset yet); any other value that is not an RFC 3339 time is an error.
+func quotaUsageTime(value ojson.Result, name string) (time.Time, error) {
+	if !value.Exists() || value.Type == ojson.Null {
+		return time.Time{}, nil
+	}
+	if value.Type != ojson.String {
+		return time.Time{}, fmt.Errorf("parse usage: %s is not a string", name)
+	}
+	parsed, errParse := time.Parse(time.RFC3339, value.String())
+	if errParse != nil {
+		return time.Time{}, fmt.Errorf("parse usage: %s: %w", name, errParse)
+	}
+	return parsed.Truncate(time.Second), nil
 }
 
 // quotaUsageCall is one in-flight usage read of one login. applied is set before done is
@@ -255,7 +297,11 @@ func (m *Manager) readQuotaUsage(ctx context.Context, auth *Auth) (quotaUsageRep
 	req.Header.Set("anthropic-beta", quotaUsageBeta)
 	req.Header.Set("Accept", "application/json")
 	client := &http.Client{Timeout: quotaUsageTimeout}
-	if transport := m.quotaUsageTransport(auth); transport != nil {
+	transport, errTransport := m.quotaUsageTransport(auth)
+	if errTransport != nil {
+		return quotaUsageReport{}, errTransport
+	}
+	if transport != nil {
 		client.Transport = transport
 	}
 	resp, errDo := client.Do(req)
@@ -281,23 +327,36 @@ func (m *Manager) readQuotaUsage(ctx context.Context, auth *Auth) (quotaUsageRep
 	return parseQuotaUsage(data)
 }
 
-// quotaUsageTransport returns the login's proxy transport, else the global proxy-url
-// transport, else nil for the default transport.
-func (m *Manager) quotaUsageTransport(auth *Auth) http.RoundTripper {
+// quotaUsageTransport returns the transport of the login's own proxy-url, else of the
+// global proxy-url, else nil for the default transport. A proxy-url that cannot be used is
+// an error: the read must not leave through another route than the configured one.
+func (m *Manager) quotaUsageTransport(auth *Auth) (http.RoundTripper, error) {
 	if transport := m.roundTripperFor(auth); transport != nil {
-		return transport
+		return transport, nil
 	}
-	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
-	if cfg == nil || strings.TrimSpace(cfg.ProxyURL) == "" {
-		return nil
+	proxyURL, name := "", "login proxy-url"
+	if auth != nil {
+		proxyURL = strings.TrimSpace(auth.ProxyURL)
 	}
-	transport, _, errBuild := proxyutil.BuildHTTPTransport(cfg.ProxyURL)
-	if errBuild != nil || transport == nil {
-		return nil
+	if proxyURL == "" {
+		if cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config); cfg != nil {
+			proxyURL, name = strings.TrimSpace(cfg.ProxyURL), "proxy-url"
+		}
+	}
+	if proxyURL == "" {
+		return nil, nil
+	}
+	transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
+	if errBuild != nil {
+		return nil, fmt.Errorf("%s transport: %w", name, errBuild)
+	}
+	if transport == nil {
+		// The setting says to inherit the environment, which the default transport does.
+		return nil, nil
 	}
 	// The transport serves this one read; do not keep its connection.
 	transport.DisableKeepAlives = true
-	return transport
+	return transport, nil
 }
 
 // applyQuotaUsage applies a fresh usage read to one login: when every limit that cools

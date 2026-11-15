@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -9,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
@@ -141,26 +141,21 @@ func TestCooldownRefusalNamesLimitAndReset(t *testing.T) {
 			if !errors.As(err, &refusal) || refusal.StatusCode() != http.StatusTooManyRequests {
 				t.Fatalf("pick = %v, want a cooldown refusal", err)
 			}
-			var body struct {
-				Error struct {
-					Code    string `json:"code"`
-					Message string `json:"message"`
-				} `json:"error"`
+			if !ojson.Valid(err.Error()) || ojson.Get(err.Error(), "error.code").String() != "model_cooldown" {
+				t.Fatalf("refusal body = %s", err.Error())
 			}
-			if errJSON := json.Unmarshal([]byte(err.Error()), &body); errJSON != nil || body.Error.Code != "model_cooldown" {
-				t.Fatalf("refusal body = %s (%v)", err.Error(), errJSON)
-			}
+			message := ojson.Get(err.Error(), "error.message").String()
 			sentence := quotaRefusalSentence(tc.limit, cooldown.until, time.Local)
-			if !strings.HasPrefix(body.Error.Message, sentence+" (reset after ") {
-				t.Fatalf("message = %q, want it to start with %q and the countdown", body.Error.Message, sentence)
+			if !strings.HasPrefix(message, sentence+" (reset after ") {
+				t.Fatalf("message = %q, want it to start with %q and the countdown", message, sentence)
 			}
 			if !strings.Contains(sentence, cooldown.until.In(time.Local).Format("Mon 2 Jan 15:04")) {
 				t.Fatalf("sentence %q lacks the local reset time", sentence)
 			}
-			if fable := strings.Contains(body.Error.Message, "A Fable reset does not lift it."); fable != (tc.limit == quotaLimitWeeklyAll) {
-				t.Fatalf("message %q: Fable note present = %v", body.Error.Message, fable)
+			if fable := strings.Contains(message, "A Fable reset does not lift it."); fable != (tc.limit == quotaLimitWeeklyAll) {
+				t.Fatalf("message %q: Fable note present = %v", message, fable)
 			}
-			requireRefusalCountdownNear(t, body.Error.Message, cooldown.until)
+			requireRefusalCountdownNear(t, message, cooldown.until)
 
 			headers := refusal.Headers()
 			if got := headers.Get("anthropic-ratelimit-unified-status"); got != "rejected" {

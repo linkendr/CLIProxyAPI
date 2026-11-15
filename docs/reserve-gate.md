@@ -93,8 +93,8 @@ It never happens on the normal path, where a Max login serves. The upstream's ow
 
 - Request: `GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1` with `Authorization: Bearer <the login's own access token>` and `anthropic-beta: oauth-2025-04-20`, through the login's proxy setting. The body gives `seven_day.utilization` in percent (73.0 is 73%), `five_hour.utilization`, and `limits[]` with `kind` `weekly_all` and `weekly_scoped`, each with `resets_at`.
 - Limits: at most one read per login in 60 seconds, whatever its outcome (a failed read counts). Requests that arrive while a read is in flight wait for it and share its result. A read ends after 3 seconds.
-- Effect: the fresh weekly value replaces the login's reserve reading (a value without a reset is a fresh window). If every limit that cools the login now has room, the proxy clears the cooldown (`ResetQuota`) and selects again, so the login serves the same request. A cooldown is lifted only on proof: a weekly all-model cooldown needs `seven_day` below 100%; a 5-hour or model-scoped cooldown needs that value in the body and below 100%; a cooldown whose limit is not known stays. The real body read on 2026-11-15 carried `five_hour: null` on both logins while they were in use. A 5-hour cooldown therefore has no proven room and stays until its own reset.
-- Failure: a failed, slow or unparsable read changes nothing. The refusal or the credit key fallback then goes ahead as before. The log line names the login by its auth index, never by token or email.
+- Effect: the fresh weekly value replaces the login's reserve reading (a value without a reset is a fresh window). If every limit that cools the login now has room, the proxy clears the cooldown (`ResetQuota`) and selects again, so the login serves the same request. A cooldown is lifted only on proof: a weekly all-model cooldown needs `seven_day` below 100%; a 5-hour or model-scoped cooldown needs that value in the body and below 100%; a cooldown whose limit is not known stays. The body can carry `five_hour: null`. A 5-hour cooldown then has no proven room and stays until its own reset.
+- Failure: a failed, slow or unparsable read changes nothing. A value of the wrong type or a reset that is not an RFC 3339 time makes the whole body unparsable, and a `proxy-url` (the login's or the global one) that cannot be used fails the read before a request is sent. The refusal or the credit key fallback then goes ahead as before. The log line names the login by its auth index, never by token or email.
 
 **Timeout exception.** `AGENTS.md` allows timeouts only during credential acquisition. The usage read is a separate control call made before a refusal or a fallback, not part of an upstream model request, and it must not delay the caller. It therefore carries a 3-second timeout; `AGENTS.md` lists it with the other exceptions.
 
@@ -115,23 +115,20 @@ A 429 that the proxy itself sends for a Claude limit names the limit and the res
 | cooldown with no known limit | `Rate limit. Next retry Sun 15 Nov 21:00.` |
 
 - The time is the proxy host's local time. For a real limit it is the end of the cooldown the proxy took from the upstream response (its reset header), of the login that serves again first. For a reserve hold it is the earliest release.
-- After the sentence comes ` (reset after 119h 59m 30s)`, the time left. T3 Code reads the reset time from this text (see below).
+- After the sentence comes ` (reset after 119h 59m 30s)`, the time left, for a client that reads the reset time from the text.
 - When every Max login is at a real limit, an ordinary caller's refusal names that real limit, not the reserve: the reserve is then not what refuses the caller. The error stays a reserve hold inside the proxy, so nothing is retried.
 - The manual `hold` keeps its text and has no reset.
 - Headers: `Retry-After` (seconds), `anthropic-ratelimit-unified-status: rejected`, `anthropic-ratelimit-unified-reset` (Unix seconds) and `anthropic-ratelimit-unified-representative-claim` (`seven_day` for the weekly limit and the reserve, `seven_day_overage_included` for a model-scoped limit, `five_hour`; absent when the limit is not known). Refusal headers reach the client whatever `passthrough-headers` says. A cooldown refusal with no cooled Max login behind it follows upstream: `Retry-After` always, the unified headers only with `passthrough-headers: true`.
 
-What the clients do with this was checked against Claude Code 2.1.312, the client T3 Code 0.1.9 runs (proof: `HEADERS-PROOF.md` in the task's evidence folder):
-
-- T3 Code starts Claude Code with `ANTHROPIC_AUTH_TOKEN`. In that mode Claude Code ignores every `anthropic-ratelimit-unified-*` header and sends no `rate_limit_event`. T3 Code 0.1.9 takes the reset time only from the text `(reset after Xh Ym Zs)` of a 429. Before this change the refusals had no such text, so every T3 `usage_limit` failure had `resetAt: null`.
-- A Claude Code session with a subscription login reads the headers: with the representative claim it reports `rate_limit_event` with `resetsAt` and the limit type, and shows "You've hit your weekly limit · resets ...".
+Note, not covered by the tests of this repository: how a client uses these fields depends on the client and its version. One reading of Claude Code under T3 Code is recorded outside the repository, in the pull request that added this section. In that reading a client started with `ANTHROPIC_AUTH_TOKEN` ignored the unified headers and took the reset time from the text, and a client with a subscription login read the headers.
 
 ### Credit key responses
 
 Anthropic sends the unified limit headers only for a subscription login. A response a Claude API key served (a credit key) therefore carried none, and a client that meters the weekly limit from headers kept its last value. Such a response now carries the headers that describe the Max logins: `anthropic-ratelimit-unified-status: allowed`, `-representative-claim: seven_day`, `-reset`, `-7d-utilization` and `-7d-reset`, from the Max login with the most room (a login at a real limit counts as full). Headers that already carry a unified status, responses of other credentials and a pool with no known reset stay as they were.
 
-- The status is always `allowed`. Claude Code treats `rejected` in the top-level status as a limit event even on a 200, so the proxy never sends it on a served response. With `allowed` a served response stays a success in both auth modes (proof in `HEADERS-PROOF.md`).
+- The status is always `allowed`: a served response must not read as a limit event, so the proxy never sends `rejected` on it.
 - Clients receive response headers only with `passthrough-headers: true`.
-- T3 Code's own meter is not fed by this: in its `ANTHROPIC_AUTH_TOKEN` mode Claude Code ignores these headers. The quota state file is the source for tools on this host.
+- A client that ignores these headers (see the note above) is not fed by this. The quota state file is the source for tools on this host.
 
 ### Quota state file
 

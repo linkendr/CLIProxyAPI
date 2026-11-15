@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -159,13 +160,21 @@ func TestParseQuotaUsage(t *testing.T) {
 	}
 
 	for name, body := range map[string]string{
-		"not JSON":           `<html>busy</html>`,
-		"empty object":       `{}`,
-		"no weekly value":    `{"five_hour": {"utilization": 3}, "limits": [{"kind": "weekly_scoped", "percent": 3}]}`,
-		"null utilization":   `{"seven_day": {"utilization": null}}`,
-		"negative":           `{"seven_day": {"utilization": -1}}`,
-		"wrong type":         `{"seven_day": {"utilization": "73"}}`,
-		"error from gateway": `{"type": "error", "error": {"type": "authentication_error", "message": "expired"}}`,
+		"not JSON":                  `<html>busy</html>`,
+		"empty object":              `{}`,
+		"no weekly value":           `{"five_hour": {"utilization": 3}, "limits": [{"kind": "weekly_scoped", "percent": 3}]}`,
+		"null utilization":          `{"seven_day": {"utilization": null}}`,
+		"negative":                  `{"seven_day": {"utilization": -1}}`,
+		"wrong type":                `{"seven_day": {"utilization": "73"}}`,
+		"error from gateway":        `{"type": "error", "error": {"type": "authentication_error", "message": "expired"}}`,
+		"window not an object":      `{"seven_day": "soon"}`,
+		"malformed reset":           `{"seven_day": {"utilization": 4, "resets_at": "tomorrow"}}`,
+		"empty reset":               `{"seven_day": {"utilization": 4, "resets_at": ""}}`,
+		"reset not a string":        `{"seven_day": {"utilization": 4, "resets_at": 1795000000}}`,
+		"malformed reset in limits": `{"limits": [{"kind": "weekly_all", "percent": 4, "resets_at": "tomorrow"}]}`,
+		"limits not an array":       `{"seven_day": {"utilization": 4}, "limits": {"kind": "weekly_all"}}`,
+		"limit not an object":       `{"seven_day": {"utilization": 4}, "limits": [4]}`,
+		"percent not a number":      `{"seven_day": {"utilization": 4}, "limits": [{"kind": "weekly_scoped", "percent": "4"}]}`,
 	} {
 		if _, errParse := parseQuotaUsage([]byte(body)); errParse == nil {
 			t.Errorf("%s: parsed without error", name)
@@ -173,9 +182,8 @@ func TestParseQuotaUsage(t *testing.T) {
 	}
 }
 
-// The body has the shape Anthropic returned for a Max login in use on 2026-11-15: no
-// five-hour window, integer percents, and many keys the parser does not know. Strings the
-// record kept only by length are invented.
+// A body with the keys of a full usage answer: no five-hour window, integer percents, and
+// many keys the parser does not know. The values are invented.
 func TestParseQuotaUsageRealBodyShape(t *testing.T) {
 	report, err := parseQuotaUsage([]byte(`{
 		"five_hour": null,
@@ -379,13 +387,23 @@ func TestQuotaUsageFailedReadChangesNothing(t *testing.T) {
 			}
 		},
 		"unparsable": func(t *testing.T, rig *reserveRig, _ *quotaUsageFake) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = w.Write([]byte(`{"seven_day": "soon"}`))
-			}))
-			t.Cleanup(server.Close)
-			rig.setAccessTokens(t)
-			rig.manager.quotaUsage.url = server.URL
-			rig.manager.quotaUsage.read = nil
+			rig.serveUsage(t, `{"seven_day": "soon"}`)
+		},
+		// The body reports room, but its reset is not a time: the report is refused whole.
+		"malformed reset": func(t *testing.T, rig *reserveRig, _ *quotaUsageFake) {
+			rig.serveUsage(t, `{"seven_day": {"utilization": 4.0, "resets_at": "tomorrow"}}`)
+		},
+		// The endpoint would report room, but the configured proxy cannot be used: the read
+		// fails and no request leaves by another route.
+		"unusable proxy-url": func(t *testing.T, rig *reserveRig, _ *quotaUsageFake) {
+			requests := rig.serveUsage(t, `{"seven_day": {"utilization": 4.0, "resets_at": "2099-01-01T00:00:00Z"}}`)
+			cfg, _ := rig.manager.runtimeConfig.Load().(*internalconfig.Config)
+			cfg.ProxyURL = "ftp://proxy.invalid:1"
+			t.Cleanup(func() {
+				if n := requests.Load(); n != 0 {
+					t.Errorf("%d usage requests left without the configured proxy, want 0", n)
+				}
+			})
 		},
 	}
 	for name, setup := range cases {
@@ -420,6 +438,52 @@ func TestQuotaUsageFailedReadChangesNothing(t *testing.T) {
 			}
 			if !rig.cooled(rig.a) || !rig.cooled(rig.b) {
 				t.Fatal("a failed read before the refusal cleared a cooldown")
+			}
+		})
+	}
+}
+
+// serveUsage makes the real read answer every login with body, and counts the requests.
+func (r *reserveRig) serveUsage(t *testing.T, body string) *atomic.Int32 {
+	t.Helper()
+	requests := &atomic.Int32{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(server.Close)
+	r.setAccessTokens(t)
+	r.manager.quotaUsage.url = server.URL
+	r.manager.quotaUsage.read = nil
+	return requests
+}
+
+// A proxy-url that cannot be used fails the read by name, for the login's own setting and
+// for the global one, before any request is sent.
+func TestQuotaUsageReadFailsOnUnusableProxy(t *testing.T) {
+	for name, tc := range map[string]struct {
+		login, global, want string
+	}{
+		"login proxy-url":  {"ftp://proxy.invalid:1", "", "login proxy-url transport: "},
+		"global proxy-url": {"", "ftp://proxy.invalid:1", "proxy-url transport: "},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rig := newReserveRig(t, &RoundRobinSelector{}, true, reserveGateOn(nil))
+			requests := rig.serveUsage(t, `{"seven_day": {"utilization": 4.0}}`)
+			cfg, _ := rig.manager.runtimeConfig.Load().(*internalconfig.Config)
+			cfg.ProxyURL = tc.global
+			auth := &Auth{ID: rig.a, ProxyURL: tc.login, Metadata: map[string]any{"access_token": "t"}}
+			_, err := rig.manager.readQuotaUsage(context.Background(), auth)
+			if err == nil || !strings.HasPrefix(err.Error(), tc.want) {
+				t.Fatalf("read = %v, want an error starting %q", err, tc.want)
+			}
+			if n := requests.Load(); n != 0 {
+				t.Fatalf("%d usage requests sent, want 0", n)
+			}
+			cfg.ProxyURL = ""
+			auth.ProxyURL = ""
+			if report, errRead := rig.manager.readQuotaUsage(context.Background(), auth); errRead != nil || report.weeklyAll != 0.04 || requests.Load() != 1 {
+				t.Fatalf("read without a proxy-url = %+v, %v after %d requests; want 4%% from one request", report, errRead, requests.Load())
 			}
 		})
 	}

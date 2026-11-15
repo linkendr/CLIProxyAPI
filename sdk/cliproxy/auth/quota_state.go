@@ -2,7 +2,7 @@ package auth
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -130,24 +131,54 @@ func (m *Manager) syncQuotaState(now time.Time) {
 	doc.Interactive.Since = quotaRouteSince(writer.interactive, doc.Interactive.Route, now)
 	doc.Automation.Since = quotaRouteSince(writer.automation, doc.Automation.Route, now)
 	writer.interactive, writer.automation = doc.Interactive, doc.Automation
-	content := doc.content()
-	if content == writer.last && now.Sub(writer.written) < quotaStateRefresh {
-		return
+	content, errWrite := doc.content()
+	if errWrite == nil {
+		if content == writer.last && now.Sub(writer.written) < quotaStateRefresh {
+			return
+		}
+		doc.WrittenAt = now.UTC().Truncate(time.Second)
+		errWrite = doc.write(path)
 	}
-	doc.WrittenAt = now.UTC().Truncate(time.Second)
-	data, errMarshal := json.MarshalIndent(doc, "", "  ")
-	if errMarshal == nil {
-		errMarshal = writeStateFileAtomic(path, append(data, '\n'))
-	}
-	if errMarshal != nil {
+	if errWrite != nil {
 		if !writer.failed {
-			log.Warnf("quota state: cannot write %s: %v", path, errMarshal)
+			log.Warnf("quota state: cannot write %s: %v", path, errWrite)
 		}
 		writer.failed = true
 		return
 	}
 	writer.failed = false
 	writer.last, writer.written = content, now
+}
+
+// encode builds the JSON document of d, fields in the order of the schema.
+func (d quotaStateDoc) encode() (*ojson.Doc, error) {
+	out := ojson.NewDocString("{}")
+	for _, field := range []struct {
+		key   string
+		value any
+	}{
+		{"schema", d.Schema},
+		{"written_at", d.WrittenAt},
+		{"interactive", d.Interactive},
+		{"automation", d.Automation},
+		{"reserve", d.Reserve},
+		{"logins", d.Logins},
+	} {
+		if errSet := out.Set(field.key, field.value); errSet != nil {
+			return nil, fmt.Errorf("encode %s: %w", field.key, errSet)
+		}
+	}
+	return out, nil
+}
+
+// write replaces the file at path with d, indented, mode 0600.
+func (d quotaStateDoc) write(path string) error {
+	out, errEncode := d.encode()
+	if errEncode != nil {
+		return errEncode
+	}
+	pretty := ojson.GetBytes(out.Bytes(), "@pretty").Raw
+	return writeStateFileAtomic(path, []byte(strings.TrimRight(pretty, "\n")+"\n"))
 }
 
 // quotaRouteSince keeps the since of an unchanged route.
@@ -160,7 +191,7 @@ func quotaRouteSince(prev quotaStateRoute, route string, now time.Time) time.Tim
 
 // content is the document without the fields that change on every write or response
 // (written_at, read_at), for change detection.
-func (d quotaStateDoc) content() string {
+func (d quotaStateDoc) content() (string, error) {
 	d.WrittenAt = time.Time{}
 	logins := make([]quotaStateLogin, len(d.Logins))
 	copy(logins, d.Logins)
@@ -168,8 +199,11 @@ func (d quotaStateDoc) content() string {
 		logins[i].ReadAt = nil
 	}
 	d.Logins = logins
-	data, _ := json.Marshal(d)
-	return string(data)
+	out, errEncode := d.encode()
+	if errEncode != nil {
+		return "", errEncode
+	}
+	return out.String(), nil
 }
 
 // runQuotaStateTicker keeps the quota state file fresh until ctx ends. Changes that
