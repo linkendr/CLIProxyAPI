@@ -47,8 +47,8 @@ type quotaUsageReport struct {
 // parseQuotaUsage reads the usage body: seven_day.utilization in percent (73.0 is 73%),
 // five_hour, and limits[] with kind weekly_all and weekly_scoped. A body without a weekly
 // all-model value is an error, and so is a value of the wrong type or a reset that is not
-// a time in any of these windows, used or not, so the caller changes nothing. A key that
-// is absent or null is not known.
+// a time in any of these windows, used or not, and a kind that is not a string, so the
+// caller changes nothing. A key that is absent or null is not known.
 func parseQuotaUsage(data []byte) (quotaUsageReport, error) {
 	if !ojson.ValidBytes(data) {
 		return quotaUsageReport{}, errors.New("parse usage: body is not JSON")
@@ -74,7 +74,11 @@ func parseQuotaUsage(data []byte) (quotaUsageReport, error) {
 		if !limit.IsObject() {
 			return quotaUsageReport{}, fmt.Errorf("parse usage: %s is not an object", name)
 		}
-		kind := limit.Get("kind").String()
+		kindValue := limit.Get("kind")
+		if kindValue.Exists() && kindValue.Type != ojson.Null && kindValue.Type != ojson.String {
+			return quotaUsageReport{}, fmt.Errorf("parse usage: %s.kind is not a string", name)
+		}
+		kind := kindValue.String()
 		if kind != quotaLimitWeeklyAll && kind != quotaLimitWeeklyScoped {
 			continue
 		}

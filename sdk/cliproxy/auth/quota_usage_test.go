@@ -695,54 +695,143 @@ func TestQuotaUsageLiftsOnlyTheLimitWithRoom(t *testing.T) {
 	}
 }
 
-// A body that reports room but carries a reset that is not a time, in any window the
-// proxy knows, lifts no cooldown. The same body with valid resets lifts it.
-func TestQuotaUsageMalformedResetKeepsCooldown(t *testing.T) {
+// usageWindowCase is one window of a usage answer that the parser knows.
+type usageWindowCase struct {
+	path    string // the path the parser names in an error
+	percent string // the key of the percent
+	kind    string // the kind of a limits entry; empty for a top-level window
+}
+
+var usageWindowCases = []usageWindowCase{
+	{"seven_day", "utilization", ""},
+	{"five_hour", "utilization", ""},
+	{"limits.0", "percent", quotaLimitWeeklyAll},
+	{"limits.1", "percent", quotaLimitWeeklyScoped},
+}
+
+const usageValidReset = `"2099-01-01T00:00:00Z"`
+
+func usageWindowJSON(w usageWindowCase, percent, reset string) string {
+	kind := ""
+	if w.kind != "" {
+		kind = fmt.Sprintf(`"kind": %q, `, w.kind)
+	}
+	return fmt.Sprintf(`{%s%q: %s, "resets_at": %s}`, kind, w.percent, percent, reset)
+}
+
+// usageBody is a usage answer that reports room (10%) in every window the parser knows.
+// replace maps the path of a window, or "limits", to the JSON written in its place.
+func usageBody(replace map[string]string) string {
+	windows := make([]string, len(usageWindowCases))
+	for i, w := range usageWindowCases {
+		windows[i] = usageWindowJSON(w, "10", usageValidReset)
+		if other, replaced := replace[w.path]; replaced {
+			windows[i] = other
+		}
+	}
+	limits := "[" + windows[2] + ", " + windows[3] + "]"
+	if other, replaced := replace["limits"]; replaced {
+		limits = other
+	}
+	return fmt.Sprintf(`{"seven_day": %s, "five_hour": %s, "limits": %s}`, windows[0], windows[1], limits)
+}
+
+// malformedUsageBodies is every body that differs from usageBody(nil) by one value of the
+// wrong form: the body, limits, and for each window the parser knows the window itself,
+// its kind, its percent and its reset, the reset with and without a percent beside it.
+// The key is the path of that value, then the value.
+func malformedUsageBodies() map[string]string {
+	bodies := map[string]string{}
+	for _, bad := range []string{`<html>busy</html>`, ``, `null`, `4`, `"soon"`, `true`, `[]`} {
+		bodies["body = "+bad] = bad
+	}
+	for _, bad := range []string{`4`, `"soon"`, `true`, `{}`} {
+		bodies["limits = "+bad] = usageBody(map[string]string{"limits": bad})
+	}
+	for _, w := range usageWindowCases {
+		for _, bad := range []string{`4`, `"soon"`, `true`, `[]`} {
+			bodies[w.path+" = "+bad] = usageBody(map[string]string{w.path: bad})
+		}
+		// A kind that is a string the parser does not know is another limit, not an error.
+		for _, bad := range []string{`4`, `true`, `{}`, `[]`} {
+			if w.kind != "" {
+				entry := fmt.Sprintf(`{"kind": %s, "percent": 10, "resets_at": %s}`, bad, usageValidReset)
+				bodies[w.path+".kind = "+bad] = usageBody(map[string]string{w.path: entry})
+			}
+		}
+		for _, bad := range []string{`"4"`, `true`, `{}`, `[4]`, `-1`} {
+			bodies[w.path+"."+w.percent+" = "+bad] = usageBody(map[string]string{w.path: usageWindowJSON(w, bad, usageValidReset)})
+		}
+		for _, bad := range []string{`"tomorrow"`, `""`, `"2099-01-01"`, `1795000000`, `true`, `{}`, `[]`} {
+			bodies[w.path+".resets_at = "+bad] = usageBody(map[string]string{w.path: usageWindowJSON(w, "10", bad)})
+			bodies[w.path+".resets_at = "+bad+", no percent"] = usageBody(map[string]string{w.path: usageWindowJSON(w, "null", bad)})
+		}
+	}
+	return bodies
+}
+
+// The body the table is built on parses, and every body of the table fails on the value
+// it replaced.
+func TestParseQuotaUsageRejectsEveryMalformedValue(t *testing.T) {
+	report, err := parseQuotaUsage([]byte(usageBody(nil)))
+	want := quotaUsageReport{weeklyAll: 0.10, weeklyScoped: 0.10, scopedKnown: true, fiveHour: 0.10, fiveHourKnown: true}
+	want.weeklyReset = report.weeklyReset
+	if err != nil || report != want || report.weeklyReset.IsZero() {
+		t.Fatalf("valid body = %+v, %v; want %+v", report, err, want)
+	}
+	for name, body := range malformedUsageBodies() {
+		_, errParse := parseQuotaUsage([]byte(body))
+		if errParse == nil {
+			t.Errorf("%s: parsed without error", name)
+			continue
+		}
+		path, _, _ := strings.Cut(name, " = ")
+		if path != "body" && !strings.Contains(errParse.Error(), path) {
+			t.Errorf("%s: error %q does not name %s", name, errParse, path)
+		}
+	}
+}
+
+// A body that reports room in every window lifts a five-hour cooldown and a model
+// cooldown. Every body of the malformed table lifts neither: the credit key serves, as
+// without a read.
+func TestQuotaUsageMalformedValueKeepsCooldown(t *testing.T) {
 	rejection := func(window string) http.Header {
 		headers := unifiedHeaders(map[string]float64{"7d": 0.40}, time.Now().Add(48*time.Hour))
 		headers.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 		headers.Set("Anthropic-Ratelimit-Unified-"+window+"-Status", "rejected")
 		return headers
 	}
-	fiveHourLimit := func(t *testing.T, rig *reserveRig, id string) { rig.limitWith(t, id, rejection("5h")) }
-	modelLimit := func(t *testing.T, rig *reserveRig, id string) { rig.limitModel(t, id, rejection("7d_oi")) }
-	const valid, malformed = "2099-01-01T00:00:00Z", "tomorrow"
-	for name, tc := range map[string]struct {
-		cool             func(t *testing.T, rig *reserveRig, id string)
-		fiveHour, scoped string
-		lifted           bool
-	}{
-		"5-hour limit, valid resets":           {fiveHourLimit, valid, valid, true},
-		"5-hour limit, malformed 5-hour reset": {fiveHourLimit, malformed, valid, false},
-		"5-hour limit, malformed scoped reset": {fiveHourLimit, valid, malformed, false},
-		"model limit, valid resets":            {modelLimit, valid, valid, true},
-		"model limit, malformed scoped reset":  {modelLimit, valid, malformed, false},
-		"model limit, malformed 5-hour reset":  {modelLimit, malformed, valid, false},
+	for limit, cool := range map[string]func(t *testing.T, rig *reserveRig, id string){
+		"5-hour limit": func(t *testing.T, rig *reserveRig, id string) { rig.limitWith(t, id, rejection("5h")) },
+		"model limit":  func(t *testing.T, rig *reserveRig, id string) { rig.limitModel(t, id, rejection("7d_oi")) },
 	} {
-		t.Run(name, func(t *testing.T) {
+		pick := func(t *testing.T, body string) (*reserveRig, *Auth, error) {
 			rig := newReserveRig(t, &RoundRobinSelector{}, true, reserveGateOn(nil))
-			tc.cool(t, rig, rig.a)
-			tc.cool(t, rig, rig.b)
-			requests := rig.serveUsage(t, fmt.Sprintf(`{
-				"seven_day": {"utilization": 40, "resets_at": %q},
-				"five_hour": {"utilization": 10, "resets_at": %q},
-				"limits": [{"kind": "weekly_scoped", "percent": 30, "resets_at": %q}]}`, valid, tc.fiveHour, tc.scoped))
-
+			cool(t, rig, rig.a)
+			cool(t, rig, rig.b)
+			requests := rig.serveUsage(t, body)
 			auth, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
 			if requests.Load() == 0 {
 				t.Fatal("no usage read before the fallback")
 			}
-			if tc.lifted {
-				requireMaxLogin(t, rig, auth, err)
-				return
-			}
-			if err != nil || auth.ID != rig.credit {
-				t.Fatalf("pick = %v, %v; want the credit key, as without a read", auth, err)
-			}
-			if !rig.cooled(rig.a) || !rig.cooled(rig.b) {
-				t.Fatal("a body with a malformed reset cleared a cooldown")
-			}
+			return rig, auth, err
+		}
+		t.Run(limit+", valid body", func(t *testing.T) {
+			rig, auth, err := pick(t, usageBody(nil))
+			requireMaxLogin(t, rig, auth, err)
 		})
+		for name, body := range malformedUsageBodies() {
+			t.Run(limit+", "+name, func(t *testing.T) {
+				rig, auth, err := pick(t, body)
+				if err != nil || auth.ID != rig.credit {
+					t.Fatalf("pick = %v, %v; want the credit key, as without a read", auth, err)
+				}
+				if !rig.cooled(rig.a) || !rig.cooled(rig.b) {
+					t.Fatal("a malformed body cleared a cooldown")
+				}
+			})
+		}
 	}
 }
 
