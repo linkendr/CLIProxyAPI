@@ -173,6 +173,72 @@ func TestParseQuotaUsage(t *testing.T) {
 	}
 }
 
+// The body has the shape Anthropic returned for a Max login in use on 2026-11-15: no
+// five-hour window, integer percents, and many keys the parser does not know. Strings the
+// record kept only by length are invented.
+func TestParseQuotaUsageRealBodyShape(t *testing.T) {
+	report, err := parseQuotaUsage([]byte(`{
+		"five_hour": null,
+		"seven_day": {
+			"utilization": 18.0, "resets_at": "2026-11-20T16:00:00.321426+00:00",
+			"limit_dollars": null, "used_dollars": null, "remaining_dollars": null, "locked_reason": null
+		},
+		"seven_day_oauth_apps": null, "seven_day_opus": null, "seven_day_sonnet": null,
+		"seven_day_cowork": null, "seven_day_omelette": null, "tangelo": null,
+		"iguana_necktie": null, "omelette_promotional": null, "nimbus_quill": null,
+		"cinder_cove": null, "copper_kite": null, "brass_thimble": null, "harbor_lantern": null,
+		"wattle_ember": null, "promo_credits": null, "amber_ladder": null, "granite_teacup": null,
+		"amber_cistern": null, "amber_cistern_offer": null, "juniper_tide": null,
+		"starry_waterfall": null, "amber_gauge": null, "pace": null, "indicator": null,
+		"extra_usage": null, "spend": null,
+		"cedar_ember": {
+			"eligible": false, "ineligible_reason": "no_plan", "at_limit": false,
+			"next_grant_id": null, "weekly_resets_at": null, "cooldown_until": null, "event_props": null
+		},
+		"limits": [
+			{
+				"kind": "weekly_all", "group": "weekly", "percent": 18, "severity": "normal",
+				"resets_at": "2026-11-20T16:00:00.321426+00:00", "scope": null, "is_active": false
+			},
+			{
+				"kind": "weekly_scoped", "group": "weekly", "percent": 33, "severity": "normal",
+				"resets_at": "2026-11-20T16:00:00.321579+00:00",
+				"scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null},
+				"is_active": true
+			}
+		],
+		"member_dashboard_available": false,
+		"seven_day_breakdown": {
+			"as_of": "2026-11-15T12:00:00.123456+00:00",
+			"window_started_at": "2026-11-13T16:00:00.321426+00:00",
+			"rows": [
+				{"key": "claude_code", "display_name": "Claude Code", "percent": 100},
+				{"key": "chat", "display_name": "Chats", "percent": 0},
+				{"key": "cowork", "display_name": "Cowork", "percent": 0},
+				{"key": "other", "display_name": "Other", "percent": 0}
+			]
+		},
+		"weekly_scoped_shares": [
+			{"limit_index": 1, "used_percent_of_weekly": 17, "allowance_percent_of_weekly": 50}
+		]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.weeklyAll != 0.18 {
+		t.Errorf("weekly fraction = %v, want 0.18", report.weeklyAll)
+	}
+	if want := time.Date(2026, 11, 20, 16, 0, 0, 0, time.UTC); !report.weeklyReset.Equal(want) {
+		t.Errorf("weekly reset = %s, want %s", report.weeklyReset, want)
+	}
+	if !report.scopedKnown || report.weeklyScoped != 0.33 {
+		t.Errorf("scoped fraction = %v (known %t), want 0.33", report.weeklyScoped, report.scopedKnown)
+	}
+	if report.fiveHourKnown {
+		t.Errorf("five-hour window = %v, want unknown", report.fiveHour)
+	}
+}
+
 // The usage read never runs while a Max login can serve the caller.
 func TestQuotaUsageNotReadOnNormalPath(t *testing.T) {
 	forEachQuotaRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig, usage *quotaUsageFake) {
