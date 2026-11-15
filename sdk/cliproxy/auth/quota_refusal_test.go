@@ -119,7 +119,7 @@ func TestCooldownRefusalNamesLimitAndReset(t *testing.T) {
 		claim string
 	}{
 		{"weekly limit", func(t *testing.T, rig *reserveRig, id string) { rig.limitAt(t, id, reset) }, quotaLimitWeeklyAll, "seven_day"},
-		{"cooldown without headers", func(t *testing.T, rig *reserveRig, id string) { rig.coolDown(t, id) }, quotaLimitWeeklyAll, "seven_day"},
+		{"cooldown without headers", func(t *testing.T, rig *reserveRig, id string) { rig.coolDown(t, id) }, "", ""},
 		{"5-hour limit", func(t *testing.T, rig *reserveRig, id string) { rig.limitWith(t, id, rejection("5h")) }, quotaLimitFiveHour, "five_hour"},
 		{"model limit", func(t *testing.T, rig *reserveRig, id string) { rig.limitModel(t, id, rejection("7d_oi")) }, quotaLimitWeeklyScoped, "seven_day_overage_included"},
 		{"model cooldown that names no limit", func(t *testing.T, rig *reserveRig, id string) { rig.limitModel(t, id, http.Header{}) }, "", ""},
@@ -199,7 +199,8 @@ func TestCooldownRefusalNamesEarliestReset(t *testing.T) {
 	if got := refusal.Headers().Get("anthropic-ratelimit-unified-reset"); got != strconv.FormatInt(early.until.Unix(), 10) {
 		t.Fatalf("unified reset = %q, want the earlier reset %d", got, early.until.Unix())
 	}
-	if !strings.Contains(err.Error(), "Next reset "+early.until.In(time.Local).Format("Mon 2 Jan 15:04")+".") {
+	// These cooldowns carry no headers, so the refusal names no limit: "Next retry".
+	if !strings.Contains(err.Error(), quotaRefusalSentence(early.limit, early.until, time.Local)) {
 		t.Fatalf("refusal %q lacks the earlier reset", err.Error())
 	}
 }

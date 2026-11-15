@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -261,6 +262,7 @@ func (m *Manager) refreshQuotaUsageOf(ctx context.Context, auth *Auth) bool {
 	entry.last, entry.inflight = now, call
 	read, timeout := reader.read, reader.timeout
 	reader.mu.Unlock()
+	started := m.quotaUsageStart(auth.ID, now)
 	if read == nil {
 		read = m.readQuotaUsage
 	}
@@ -272,10 +274,13 @@ func (m *Manager) refreshQuotaUsageOf(ctx context.Context, auth *Auth) bool {
 	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	report, errRead := read(readCtx, auth)
 	cancel()
+	if errRead == nil {
+		errRead = report.checkAt(now)
+	}
 	if errRead != nil {
 		log.Warnf("quota usage: read for login %s failed, nothing changed: %v", quotaAuthIndex(auth), errRead)
 	} else {
-		call.applied = m.applyQuotaUsage(context.WithoutCancel(ctx), auth.ID, report, reader.clock())
+		call.applied = m.applyQuotaUsage(context.WithoutCancel(ctx), auth.ID, report, started, reader.clock())
 	}
 	reader.mu.Lock()
 	entry.inflight = nil
@@ -369,30 +374,64 @@ func (m *Manager) quotaUsageTransport(auth *Auth) (http.RoundTripper, error) {
 	return transport, nil
 }
 
-// applyQuotaUsage applies a fresh usage read to one login: when every limit that cools
-// the login has room again it clears the cooldown (ResetQuota), and the fresh weekly
-// reading replaces the login's reserve reading. It reports whether that lifted a
-// cooldown or changed the reading, so a new selection can differ. The caller must not
+// quotaUsageStart is what the proxy knew of a login when a usage read of it started.
+type quotaUsageStart struct {
+	at        time.Time
+	cooldowns []quotaCooldown
+}
+
+// quotaUsageStart records the live quota cooldowns of a login at the start of a read.
+func (m *Manager) quotaUsageStart(authID string, now time.Time) quotaUsageStart {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return quotaUsageStart{at: now, cooldowns: quotaCooldownsOf(m.auths[authID], "", now)}
+}
+
+// had reports whether cooldown was live, with the same end, when the read started.
+func (s quotaUsageStart) had(cooldown quotaCooldown) bool {
+	return slices.ContainsFunc(s.cooldowns, func(known quotaCooldown) bool {
+		return known.limit == cooldown.limit && known.until.Equal(cooldown.until)
+	})
+}
+
+// checkAt rejects a report whose weekly reset is not after at, the start of the read: a
+// fresh report of a running window names a reset to come, and one that does not is not
+// evidence of room.
+func (r quotaUsageReport) checkAt(at time.Time) error {
+	if !r.weeklyReset.IsZero() && !r.weeklyReset.After(at) {
+		return errors.New("usage report: the weekly reset is not in the future")
+	}
+	return nil
+}
+
+// applyQuotaUsage applies a usage read to one login: when every limit that cools the
+// login has room again it clears the cooldown, and the weekly reading replaces the
+// login's reserve reading. started is the state at the start of the read; the reading is
+// dated there, so a header reading that arrived during the read stays the newer one. The
+// lift is the reset the owner can run by hand (ResetQuota): it clears every cooldown of
+// the login, also one that has another cause than quota. It reports whether that lifted
+// a cooldown or changed the reading, so a new selection can differ. The caller must not
 // hold m.mu.
-func (m *Manager) applyQuotaUsage(ctx context.Context, authID string, report quotaUsageReport, now time.Time) bool {
+func (m *Manager) applyQuotaUsage(ctx context.Context, authID string, report quotaUsageReport, started quotaUsageStart, now time.Time) bool {
 	m.mu.RLock()
 	auth := m.auths[authID]
 	known := isReserveMaxLogin(auth)
-	lift := known && quotaUsageLiftsCooldown(auth, report, now)
 	index := quotaAuthIndex(auth)
 	m.mu.RUnlock()
 	if !known {
 		return false
 	}
-	if lift {
-		if _, _, errReset := m.ResetQuota(ctx, authID); errReset != nil {
-			log.Warnf("quota usage: login %s has room again but the cooldown reset failed: %v", index, errReset)
-			lift = false
-		} else {
-			log.Infof("quota usage: login %s has room again (weekly utilization %.2f); cooldown cleared", index, report.weeklyAll)
-		}
+	reset, _, errReset := m.resetQuotaIf(ctx, authID, func(auth *Auth) bool {
+		return quotaUsageLiftsCooldown(auth, report, started, now)
+	})
+	lift := errReset == nil && reset != nil
+	switch {
+	case errReset != nil:
+		log.Warnf("quota usage: login %s has room again but the cooldown reset failed: %v", index, errReset)
+	case lift:
+		log.Infof("quota usage: login %s has room again (weekly utilization %.2f); cooldown cleared", index, report.weeklyAll)
 	}
-	reading := reserveReading{utilization: report.weeklyAll, resetAt: report.weeklyReset, observedAt: now, source: reserveReadingFromUsage}
+	reading := reserveReading{utilization: report.weeklyAll, resetAt: report.weeklyReset, observedAt: started.at, source: reserveReadingFromUsage}
 	changed := false
 	for _, window := range reserveWindows {
 		if m.reserveHolds.merge(authID, window, reading) {
@@ -409,11 +448,12 @@ func (m *Manager) applyQuotaUsage(ctx context.Context, authID string, report quo
 // quotaUsageLiftsCooldown reports whether auth has a live quota cooldown and the usage
 // report shows room for every limit that cools it. A limit the report does not carry
 // (the 5-hour window, a model-scoped weekly limit) or a cooldown whose limit is not
-// known has no proven room and stays.
-func quotaUsageLiftsCooldown(auth *Auth, report quotaUsageReport, now time.Time) bool {
+// known has no proven room and stays. So does a cooldown that began or changed after the
+// read started: the report is older than the response behind it.
+func quotaUsageLiftsCooldown(auth *Auth, report quotaUsageReport, started quotaUsageStart, now time.Time) bool {
 	cooldowns := quotaCooldownsOf(auth, "", now)
 	for _, cooldown := range cooldowns {
-		if !report.hasRoom(cooldown.limit) {
+		if !started.had(cooldown) || !report.hasRoom(cooldown.limit) {
 			return false
 		}
 	}

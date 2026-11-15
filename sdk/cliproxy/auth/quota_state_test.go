@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -168,6 +170,26 @@ func TestQuotaStatePathInTestBinary(t *testing.T) {
 	t.Setenv(quotaStateEnv, " /somewhere/quota-state.json ")
 	if path := quotaStatePath(); path != "/somewhere/quota-state.json" {
 		t.Fatalf("path from the variable = %q", path)
+	}
+}
+
+// Without a home directory there is no state file. The log says so once and names the
+// variable that sets the path.
+func TestQuotaStateHomePathLogsMissingHome(t *testing.T) {
+	hook := setupTestLoggerHook(t)
+	quotaStateNoHome = sync.Once{}
+	t.Cleanup(func() { quotaStateNoHome = sync.Once{} })
+	for range 2 {
+		if path := quotaStateHomePath("", errors.New("$HOME is not defined")); path != "" {
+			t.Fatalf("path without a home directory = %q, want none", path)
+		}
+	}
+	entries := hook.AllEntries()
+	if len(entries) != 1 || !strings.Contains(entries[0].Message, quotaStateEnv) || !strings.Contains(entries[0].Message, "$HOME is not defined") {
+		t.Fatalf("log entries = %v, want one warning that names %s and the cause", entries, quotaStateEnv)
+	}
+	if path := quotaStateHomePath("/home/owner", nil); path != "/home/owner/.local/state/cliproxyapi/quota-state.json" {
+		t.Fatalf("path under a home directory = %q", path)
 	}
 }
 

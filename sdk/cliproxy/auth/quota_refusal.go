@@ -120,9 +120,18 @@ type quotaCooldown struct {
 	until time.Time
 }
 
-// quotaCooldownsOf returns the live quota cooldowns of auth: the credential-wide one (a
-// shared window, so the weekly all-model limit unless the 5-hour window was rejected)
-// and those of its model states. A non-empty model keeps only that model's state.
+// quotaCooldownLimit names the limit behind a quota cooldown from the headers the
+// cooldown kept. A later response of the login replaces Quota.Signals, not those, so a
+// late answer cannot rename the limit.
+func quotaCooldownLimit(quota QuotaState) string {
+	if rejected, signals := claudeSignalsFromEvaluatedQuota(quota); rejected {
+		return quotaLimitFromSignals(signals)
+	}
+	return ""
+}
+
+// quotaCooldownsOf returns the live quota cooldowns of auth: the credential-wide one and
+// those of its model states. A non-empty model keeps only that model's state.
 func quotaCooldownsOf(auth *Auth, model string, now time.Time) []quotaCooldown {
 	if auth == nil {
 		return nil
@@ -130,9 +139,7 @@ func quotaCooldownsOf(auth *Auth, model string, now time.Time) []quotaCooldown {
 	var cooldowns []quotaCooldown
 	shared := ""
 	if reserveAtRealLimit(auth, now) {
-		if shared = quotaLimitFromSignals(auth.Quota.Signals); shared != quotaLimitFiveHour {
-			shared = quotaLimitWeeklyAll
-		}
+		shared = quotaCooldownLimit(auth.Quota)
 		cooldowns = append(cooldowns, quotaCooldown{limit: shared, until: auth.Quota.NextRecoverAt})
 	}
 	modelKey := canonicalModelKey(model)
@@ -143,7 +150,7 @@ func quotaCooldownsOf(auth *Auth, model string, now time.Time) []quotaCooldown {
 		if model != "" && canonicalModelKey(stateModel) != modelKey {
 			continue
 		}
-		limit := quotaLimitFromSignals(state.Quota.Signals)
+		limit := quotaCooldownLimit(state.Quota)
 		if limit == "" {
 			// A state the credential-wide cooldown reached carries no rejection of its own.
 			limit = shared

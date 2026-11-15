@@ -103,12 +103,22 @@ func quotaStatePath() string {
 	if testing.Testing() {
 		return ""
 	}
-	home, errHome := os.UserHomeDir()
+	return quotaStateHomePath(os.UserHomeDir())
+}
+
+// quotaStateHomePath is the state file under the home directory. Without a home
+// directory there is no file, which is logged once, not at every sync.
+func quotaStateHomePath(home string, errHome error) string {
 	if errHome != nil || home == "" {
+		quotaStateNoHome.Do(func() {
+			log.Warnf("quota state: no home directory (%v), so the state file is not written; set %s", errHome, quotaStateEnv)
+		})
 		return ""
 	}
 	return filepath.Join(home, ".local", "state", "cliproxyapi", "quota-state.json")
 }
+
+var quotaStateNoHome sync.Once
 
 // syncQuotaState builds the quota state and writes the file if its content changed or
 // the file is due. With no Max login there is nothing to describe and nothing is

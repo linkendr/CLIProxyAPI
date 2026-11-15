@@ -1067,6 +1067,13 @@ func dedupeStrings(values []string) []string {
 // reading: both describe the window before the reset, and a stale reading would keep
 // the login held.
 func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []string, error) {
+	return m.resetQuotaIf(ctx, authID, nil)
+}
+
+// resetQuotaIf is ResetQuota with a condition that is checked under m.mu, in the same
+// critical section as the reset, so a cooldown recorded after the caller looked is not
+// cleared. A nil due always resets. A reset that due refuses returns no auth.
+func (m *Manager) resetQuotaIf(ctx context.Context, authID string, due func(auth *Auth) bool) (*Auth, []string, error) {
 	if m == nil {
 		return nil, nil, nil
 	}
@@ -1085,7 +1092,7 @@ func (m *Manager) ResetQuota(ctx context.Context, authID string) (*Auth, []strin
 	defer releaseMutation()
 	m.mu.Lock()
 	auth, ok := m.auths[authID]
-	if !ok || auth == nil {
+	if !ok || auth == nil || (due != nil && !due(auth)) {
 		m.mu.Unlock()
 		return nil, nil, nil
 	}

@@ -398,6 +398,11 @@ func TestQuotaUsageFailedReadChangesNothing(t *testing.T) {
 		"malformed reset": func(t *testing.T, rig *reserveRig, _ *quotaUsageFake) {
 			rig.serveUsage(t, `{"seven_day": {"utilization": 4.0, "resets_at": "tomorrow"}}`)
 		},
+		// The body reports room in a weekly window that already ended: it is not a report of
+		// the running window, so it proves nothing.
+		"weekly reset in the past": func(t *testing.T, rig *reserveRig, _ *quotaUsageFake) {
+			rig.serveUsage(t, `{"seven_day": {"utilization": 4.0, "resets_at": "2020-01-01T00:00:00Z"}}`)
+		},
 		// The endpoint would report room, but the configured proxy cannot be used: the read
 		// fails and no request leaves by another route.
 		"unusable proxy-url": func(t *testing.T, rig *reserveRig, _ *quotaUsageFake) {
@@ -667,7 +672,7 @@ func TestQuotaUsageLiftsOnlyTheLimitWithRoom(t *testing.T) {
 		{"weekly limit, weekly room", func(t *testing.T, rig *reserveRig) { rig.limitAt(t, rig.a, reset) }, room, true},
 		{"weekly limit, still full", func(t *testing.T, rig *reserveRig) { rig.limitAt(t, rig.a, reset) }, quotaUsageReport{weeklyAll: 1}, false},
 		{"weekly limit, over full", func(t *testing.T, rig *reserveRig) { rig.limitAt(t, rig.a, reset) }, quotaUsageReport{weeklyAll: 1.02}, false},
-		{"cooldown without headers counts as the weekly limit", func(t *testing.T, rig *reserveRig) { rig.coolDown(t, rig.a) }, room, true},
+		{"cooldown without headers names no limit", func(t *testing.T, rig *reserveRig) { rig.coolDown(t, rig.a) }, room, false},
 		{"5-hour limit, window not reported", func(t *testing.T, rig *reserveRig) { rig.limitWith(t, rig.a, sharedRejection("5h")) }, room, false},
 		{"5-hour limit, window full", func(t *testing.T, rig *reserveRig) { rig.limitWith(t, rig.a, sharedRejection("5h")) },
 			quotaUsageReport{weeklyAll: 0.40, fiveHour: 1, fiveHourKnown: true}, false},
@@ -687,12 +692,81 @@ func TestQuotaUsageLiftsOnlyTheLimitWithRoom(t *testing.T) {
 			if !rig.cooled(rig.a) {
 				t.Fatal("setup left the login without a quota cooldown")
 			}
-			rig.manager.applyQuotaUsage(context.Background(), rig.a, tc.report, time.Now())
+			now := time.Now()
+			rig.manager.applyQuotaUsage(context.Background(), rig.a, tc.report, rig.manager.quotaUsageStart(rig.a, now), now)
 			if got := !rig.cooled(rig.a); got != tc.lifted {
 				t.Fatalf("cooldown lifted = %v, want %v", got, tc.lifted)
 			}
 		})
 	}
+}
+
+// A response that completes after the 429 replaces the header snapshot of the login. The
+// cooldown keeps the headers it was recorded with, so it is still a 5-hour cooldown and
+// a report with weekly room alone does not lift it.
+func TestQuotaUsageLateResponseDoesNotRenameCooldown(t *testing.T) {
+	forEachQuotaRig(t, internalconfig.ReserveGateConfig{}, func(t *testing.T, rig *reserveRig, usage *quotaUsageFake) {
+		rig.disable(t, rig.b)
+		rig.disable(t, rig.credit)
+		reset := time.Now().Add(48 * time.Hour).Truncate(time.Second)
+		rejected := unifiedHeaders(map[string]float64{"7d": 0.40}, reset)
+		rejected.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		rejected.Set("Anthropic-Ratelimit-Unified-5h-Status", "rejected")
+		rig.limitWith(t, rig.a, rejected)
+		rig.manager.mu.Lock()
+		late := &rig.manager.auths[rig.a].Quota
+		late.Signals = map[string]string{"anthropic-ratelimit-unified-status": "allowed"}
+		rig.manager.mu.Unlock()
+
+		usage.report(0.40, reset, rig.a)
+		_, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
+		var cooldown *modelCooldownError
+		if !errors.As(err, &cooldown) {
+			t.Fatalf("pick = %v, want the cooldown refusal", err)
+		}
+		if usage.count(rig.a) != 1 || !rig.cooled(rig.a) {
+			t.Fatalf("usage reads = %d, cooled = %v; want one read and the 5-hour cooldown kept", usage.count(rig.a), rig.cooled(rig.a))
+		}
+		if !strings.Contains(err.Error(), "Five-hour limit.") {
+			t.Fatalf("refusal = %q, want it to name the five-hour limit", err.Error())
+		}
+	})
+}
+
+// A 429 that arrives while the usage read is under way is newer than the report: the
+// report does not lift its cooldown or replace its reading. The next read does.
+func TestQuotaUsageLimitDuringReadKeepsCooldown(t *testing.T) {
+	forEachQuotaRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig, usage *quotaUsageFake) {
+		rig.disable(t, rig.b)
+		rig.disable(t, rig.credit)
+		rig.limitAt(t, rig.a, time.Now().Add(48*time.Hour).Truncate(time.Second))
+		during := time.Now().Add(160 * time.Hour).Truncate(time.Second)
+		usage.report(0.02, during, rig.a)
+		rig.manager.quotaUsage.read = func(ctx context.Context, auth *Auth) (quotaUsageReport, error) {
+			rig.limitAt(t, auth.ID, during)
+			return usage.read(ctx, auth)
+		}
+
+		_, err := rig.pick(reserveTestExemptKey, "", reserveTestClaudeModel)
+		var cooldown *modelCooldownError
+		if !errors.As(err, &cooldown) {
+			t.Fatalf("pick = %v, want the cooldown refusal: the 429 is newer than the report", err)
+		}
+		if !rig.cooled(rig.a) {
+			t.Fatal("a report older than the 429 cleared its cooldown")
+		}
+		reading, ok := rig.manager.reserveHolds.reading(rig.a, "7d")
+		if !ok || reading.utilization != 1 || !reading.resetAt.Equal(during) || reading.source == reserveReadingFromUsage {
+			t.Fatalf("book reading = %+v, %v; want the header reading of the 429", reading, ok)
+		}
+
+		rig.manager.quotaUsage.read = usage.read
+		usage.advance(quotaUsageMinInterval)
+		auth, err := rig.pick(reserveTestExemptKey, "", reserveTestClaudeModel)
+		if err != nil || auth.ID != rig.a {
+			t.Fatalf("pick after an undisturbed read = %v, %v; want %s", auth, err, rig.a)
+		}
+	})
 }
 
 // usageWindowCase is one window of a usage answer that the parser knows.
@@ -845,6 +919,29 @@ func (r *reserveRig) limitWith(t *testing.T, authID string, headers http.Header)
 		AuthID: authID, Provider: "claude", Model: reserveTestClaudeModel, Success: false, RetryAfter: &retry, CredentialScope: true,
 		Error: &Error{HTTPStatus: http.StatusTooManyRequests, Message: "limit"},
 	})
+}
+
+// The condition of a guarded reset sees the login as it is when the reset would run. A
+// refused reset changes nothing.
+func TestResetQuotaIfRefusedKeepsCooldown(t *testing.T) {
+	rig := newReserveRig(t, &RoundRobinSelector{}, true, reserveGateOn(nil))
+	rig.limitAt(t, rig.a, time.Now().Add(48*time.Hour).Truncate(time.Second))
+	before, _ := rig.manager.reserveHolds.reading(rig.a, "7d")
+	seen := false
+	auth, _, err := rig.manager.resetQuotaIf(context.Background(), rig.a, func(auth *Auth) bool {
+		seen = auth.ID == rig.a && reserveAtRealLimit(auth, time.Now())
+		return false
+	})
+	if err != nil || auth != nil || !seen {
+		t.Fatalf("refused reset = %v, %v, saw the cooled login = %v; want no auth, no error, true", auth, err, seen)
+	}
+	if after, ok := rig.manager.reserveHolds.reading(rig.a, "7d"); !rig.cooled(rig.a) || !ok || after != before {
+		t.Fatalf("after a refused reset: cooled = %v, reading = %+v, %v; want the cooldown and %+v", rig.cooled(rig.a), after, ok, before)
+	}
+	auth, _, err = rig.manager.resetQuotaIf(context.Background(), rig.a, func(*Auth) bool { return true })
+	if err != nil || auth == nil || rig.cooled(rig.a) {
+		t.Fatalf("allowed reset = %v, %v, cooled = %v; want the login without a cooldown", auth, err, rig.cooled(rig.a))
+	}
 }
 
 // The management cooldown reset alone is enough: it drops the stale reserve reading and
