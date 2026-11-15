@@ -113,6 +113,13 @@ func (c *reserveTriggerClock) observe(on bool, now time.Time, windDown time.Dura
 	return c.since
 }
 
+// start returns when the trigger turned on, zero while it is off.
+func (c *reserveTriggerClock) start() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.since
+}
+
 func (c *reserveTriggerClock) clear() {
 	c.mu.Lock()
 	c.since = time.Time{}

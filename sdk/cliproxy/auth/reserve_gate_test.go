@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -255,8 +256,31 @@ func requireRetryAfterNear(t *testing.T, err error, reset time.Time) {
 	if errParse != nil || retryAfter < want-60 || retryAfter > want+60 {
 		t.Fatalf("Retry-After = %q, want about %d seconds (reset %s)", SafeResponseHeaders(err).Get("Retry-After"), want, reset.UTC().Format(time.RFC3339))
 	}
-	if !strings.Contains(err.Error(), reset.UTC().Format(time.RFC3339)) {
-		t.Fatalf("message %s does not name the earliest reset %s", err.Error(), reset.UTC().Format(time.RFC3339))
+	if local := reset.In(time.Local).Format(quotaRefusalTimeLayout); !strings.Contains(err.Error(), local) {
+		t.Fatalf("message %s does not name the earliest reset in local time (%s)", err.Error(), local)
+	}
+	requireRefusalCountdownNear(t, err.Error(), reset)
+}
+
+// t3ResetAfterPattern is the expression T3 Code 0.1.9 reads the reset of a refused turn
+// with (gatewayCooldownResetAt).
+var t3ResetAfterPattern = regexp.MustCompile(`\(reset after (?:(\d+)h ?)?(?:(\d+)m ?)?(?:(\d+)s)?\)`)
+
+// requireRefusalCountdownNear checks that message carries the countdown T3 Code parses
+// and that it ends at reset.
+func requireRefusalCountdownNear(t *testing.T, message string, reset time.Time) {
+	t.Helper()
+	match := t3ResetAfterPattern.FindStringSubmatch(message)
+	if match == nil {
+		t.Fatalf("message %s has no (reset after ...) countdown", message)
+	}
+	var seconds int
+	for index, unit := range []int{3600, 60, 1} {
+		value, _ := strconv.Atoi(match[index+1])
+		seconds += value * unit
+	}
+	if want := int(time.Until(reset).Seconds()); seconds < want-60 || seconds > want+60 {
+		t.Fatalf("countdown %q = %d seconds, want about %d", match[0], seconds, want)
 	}
 }
 
@@ -311,7 +335,7 @@ func requireReserveHold(t *testing.T, err error) *reserveHoldError {
 	if errJSON := json.Unmarshal([]byte(err.Error()), &body); errJSON != nil {
 		t.Fatalf("error body %q is not JSON: %v", err.Error(), errJSON)
 	}
-	if body.Type != "error" || body.Error.Type != "rate_limit_error" || !strings.HasPrefix(body.Error.Message, "quota reserve hold:") {
+	if body.Type != "error" || body.Error.Type != "rate_limit_error" || !strings.HasPrefix(strings.ToLower(body.Error.Message), "quota reserve hold:") {
 		t.Fatalf("error body = %s, want Anthropic rate_limit_error with a quota reserve hold message", err.Error())
 	}
 	if strings.Contains(body.Error.Message, "cooling down") {

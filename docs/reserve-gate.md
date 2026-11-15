@@ -19,7 +19,7 @@ The reserve follows the clock: a held login is released at the step that frees i
 
 - While at least one Max login is not held, that is while the logins together have more than the reserve left, nothing is blocked. Ordinary (non-exempt) callers may use any login, including a held one, up to its real upstream limit. The routing strategy picks as usual (pace spends the login that resets first).
 - Only when every Max login is held (the logins have no more than the reserve left) does the gate act on ordinary callers. This is the *trigger*. While it is on:
-  - **New prompt** (anything that is not a running task): refused, HTTP 429 with the reserve message and `Retry-After` set to the earliest release among the held logins (the next reserve step that frees one, or the next reset).
+  - **New prompt** (anything that is not a running task): refused, HTTP 429 with the reserve message and `Retry-After` set to the earliest release among the held logins (the next reserve step that frees one, or the next reset). Before it refuses, the proxy reads the real usage of the Max logins once (see [Quota reset recovery](#quota-reset-recovery)); the text and headers are under [Refusals](#refusals).
   - **Running task** (the request hands tool results back to the model): served for `wind-down-minutes` after the trigger turned on, in the same credential order as an exempt caller (Max logins up to their real limits, then credit keys once every Max login is at a real limit). The proxy appends one text block to the end of the last user message, after the tool results: "Quota reserve reached. Finish the current step, write a short status of what is done and what is left, and end your turn. Do not start new tool calls or subagents." The system prompt and every earlier byte stay as they were, so the prompt cache prefix is not broken.
   - **Running task after the wind-down**: refused like a new prompt.
 - When the trigger turns off (a weekly reset, a login reads lower, or the reserve steps down), everything is served again, the note stops and the wind-down clock is cleared, so the next trigger starts a fresh wind-down.
@@ -78,6 +78,92 @@ The gate keeps, per account and window (`7d`), the last reading it saw (utilizat
 - Older files: `5h` entries and fields this build does not know are ignored when the file is read and dropped on the next write.
 - `enabled: false`: the file is neither read nor written.
 
+## Quota reset recovery
+
+A cooled login gets no traffic until its recorded reset, and the reserve reads usage only from response headers. So when the owner resets a limit on Anthropic's side, the proxy would not learn it. Two things close that gap.
+
+### Usage read
+
+When no Max login can serve the caller, the proxy reads the real usage of every Max login before it gives up on them. This happens at two points only:
+
+- before a 429 refusal: a reserve hold refusal (not the manual `hold`, which no reading lifts) or a cooldown refusal on a route that includes Claude;
+- before a credit key with `fallback-when` serves the request.
+
+It never happens on the normal path, where a Max login serves. The upstream's own 429, passed on in the request that hit the limit, is not such a point either: that answer is fresh. Under Home dispatch nothing is read.
+
+- Request: `GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1` with `Authorization: Bearer <the login's own access token>` and `anthropic-beta: oauth-2025-04-20`, through the login's proxy setting. The body gives `seven_day.utilization` in percent (73.0 is 73%), `five_hour.utilization`, and `limits[]` with `kind` `weekly_all` and `weekly_scoped`, each with `resets_at`.
+- Limits: at most one read per login in 60 seconds, whatever its outcome (a failed read counts). Requests that arrive while a read is in flight wait for it and share its result. A read ends after 3 seconds.
+- Effect: the fresh weekly value replaces the login's reserve reading (a value without a reset is a fresh window). If every limit that cools the login now has room, the proxy clears the cooldown (`ResetQuota`) and selects again, so the login serves the same request. A cooldown is lifted only on proof: a weekly all-model cooldown needs `seven_day` below 100%; a 5-hour or model-scoped cooldown needs that value in the body and below 100%; a cooldown whose limit is not known stays.
+- Failure: a failed, slow or unparsable read changes nothing. The refusal or the credit key fallback then goes ahead as before. The log line names the login by its auth index, never by token or email.
+
+**Timeout exception.** `AGENTS.md` allows timeouts only during credential acquisition. The usage read is a separate control call made before a refusal or a fallback, not part of an upstream model request, and it must not delay the caller. It therefore carries a 3-second timeout; `AGENTS.md` lists it with the other exceptions.
+
+### Cooldown reset
+
+`ResetQuota` (the management cooldown reset: `routing/cooldown/reset`, or the older `reset-quota`) also drops the login's reserve reading and its stored limit signals. Both describe the window before the reset; a stale reading would keep the login held. The management reset alone is therefore enough. The login counts as having room until its next response or usage read fills the book again.
+
+### Refusals
+
+A 429 that the proxy itself sends for a Claude limit names the limit and the reset. The text is one sentence, then a countdown:
+
+| Limit | Sentence |
+|---|---|
+| weekly all-model limit of the Max logins | `Weekly limit. Next reset Fri 20 Nov 17:00. A Fable reset does not lift it.` |
+| weekly model-scoped limit | `Weekly model limit. Next reset Fri 20 Nov 17:00.` |
+| 5-hour limit | `Five-hour limit. Next reset Sun 15 Nov 21:00.` |
+| reserve hold | `Quota reserve hold: the last share of the weekly quota is kept for automations. Next release Fri 20 Nov 17:00. A Fable reset does not lift it.` |
+| cooldown with no known limit | `Rate limit. Next retry Sun 15 Nov 21:00.` |
+
+- The time is the proxy host's local time. For a real limit it is the end of the cooldown the proxy took from the upstream response (its reset header), of the login that serves again first. For a reserve hold it is the earliest release.
+- After the sentence comes ` (reset after 119h 59m 30s)`, the time left. T3 Code reads the reset time from this text (see below).
+- When every Max login is at a real limit, an ordinary caller's refusal names that real limit, not the reserve: the reserve is then not what refuses the caller. The error stays a reserve hold inside the proxy, so nothing is retried.
+- The manual `hold` keeps its text and has no reset.
+- Headers: `Retry-After` (seconds), `anthropic-ratelimit-unified-status: rejected`, `anthropic-ratelimit-unified-reset` (Unix seconds) and `anthropic-ratelimit-unified-representative-claim` (`seven_day` for the weekly limit and the reserve, `seven_day_overage_included` for a model-scoped limit, `five_hour`; absent when the limit is not known). Refusal headers reach the client whatever `passthrough-headers` says.
+
+What the clients do with this was checked against Claude Code 2.1.312, the client T3 Code 0.1.9 runs (proof: `HEADERS-PROOF.md` in the task's evidence folder):
+
+- T3 Code starts Claude Code with `ANTHROPIC_AUTH_TOKEN`. In that mode Claude Code ignores every `anthropic-ratelimit-unified-*` header and sends no `rate_limit_event`. T3 Code 0.1.9 takes the reset time only from the text `(reset after Xh Ym Zs)` of a 429. Before this change the refusals had no such text, so every T3 `usage_limit` failure had `resetAt: null`.
+- A Claude Code session with a subscription login reads the headers: with the representative claim it reports `rate_limit_event` with `resetsAt` and the limit type, and shows "You've hit your weekly limit · resets ...".
+
+### Credit key responses
+
+Anthropic sends the unified limit headers only for a subscription login. A response a Claude API key served (a credit key) therefore carried none, and a client that meters the weekly limit from headers kept its last value. Such a response now carries the headers that describe the Max logins: `anthropic-ratelimit-unified-status: allowed`, `-representative-claim: seven_day`, `-reset`, `-7d-utilization` and `-7d-reset`, from the Max login with the most room (a login at a real limit counts as full). Headers that already carry a unified status, responses of other credentials and a pool with no known reset stay as they were.
+
+- The status is always `allowed`. Claude Code treats `rejected` in the top-level status as a limit event even on a 200, so the proxy never sends it on a served response. With `allowed` a served response stays a success in both auth modes (proof in `HEADERS-PROOF.md`).
+- Clients receive response headers only with `passthrough-headers: true`.
+- T3 Code's own meter is not fed by this: in its `ANTHROPIC_AUTH_TOKEN` mode Claude Code ignores these headers. The quota state file is the source for tools on this host.
+
+### Quota state file
+
+The proxy writes what it knows to a small file for other tools (the T3 thread warning, the per-prompt hook).
+
+- Path: `$HOME/.local/state/cliproxyapi/quota-state.json`; `CLIPROXY_QUOTA_STATE` overrides it. Written by atomic replace (temp file, rename), mode 0600, folder 0700.
+- When: after every Claude response, at every dead end, after a usage read and a cooldown reset, and from a 30-second ticker; the file is rewritten when its content changed or it is 4 minutes old, so it is never 5 minutes old while the proxy runs. A reader treats a missing, unparsable or older-than-15-minutes file as unknown.
+- With no Max login nothing is written. A test binary writes no file unless `CLIPROXY_QUOTA_STATE` is set.
+- It holds no token, key, email or account name. A login is named by its auth index (a hash).
+
+```json
+{
+  "schema": "cliproxy.quota_state.v1",
+  "written_at": "2026-11-15T10:00:31Z",
+  "interactive": {"route": "max", "since": "2026-11-15T10:51:42Z", "limit": "", "retry_at": null, "wind_down_until": null, "message": ""},
+  "automation": {"route": "max", "since": "2026-11-15T10:51:42Z", "limit": "", "retry_at": null, "wind_down_until": null, "message": ""},
+  "reserve": {"active": false, "size": 0.05, "on": ["8c6f5a61f61a5ab4"]},
+  "logins": [
+    {"auth_index": "8c6f5a61f61a5ab4", "state": "ok", "limit": "", "utilization": 0.01,
+     "resets_at": "2026-11-20T16:00:00Z", "read_at": "2026-11-15T10:51:52Z", "read_from": "headers"}
+  ]
+}
+```
+
+- `interactive` is a caller whose key is not on `exempt-api-keys`; `automation` is an exempt caller. Each says what a new prompt gets now.
+- `route`: `max` (a Max login serves), `credit` (a credit key serves) or `refused` (HTTP 429). `since`: when the route last changed, as far as this process saw.
+- `limit`: `weekly_all`, `weekly_scoped`, `five_hour`, `reserve` or empty. `retry_at`: when the route is expected to return to `max`.
+- `wind_down_until`: set while running tasks are still served after new prompts are refused.
+- `message`: the refusal's sentence without the countdown; empty when the route is `max`.
+- `reserve`: `active` is the trigger (every Max login is held), `size` the reserve as a share of one login's weekly quota (0 with the gate off), `on` the logins that carry it.
+- `logins[].state`: `ok`, `held` (all its headroom is reserve) or `cooled` (a live cooldown after a real limit; `limit` names it, a model-scoped limit included). `utilization` and `resets_at` are the newest weekly reading (null without one, or once its reset has passed); `read_from` is `headers` or `usage`.
+
 ## Safe enable order
 
 1. Deploy the binary with no `routing.reserve-gate` block (gate off).
@@ -90,11 +176,14 @@ The gate keeps, per account and window (`7d`), the last reading it saw (utilizat
 ```sh
 go test ./internal/config ./sdk/cliproxy/auth ./sdk/api/handlers ./sdk/cliproxy -run 'ReserveGate|ReserveWindDown|ReserveRequest|ReserveTrigger' -count=1
 go test ./internal/runtime/executor -run ReserveWindDown -count=1
+go test ./sdk/cliproxy/auth ./sdk/api/handlers -run 'Quota|Refusal|PoolHeaders' -count=1
 bash scripts/reserve-gate-smoke/smoke.sh
 bash scripts/reserve-gate-smoke/winddown_smoke.sh <new dir>
 ```
 
-Max logins are subscription (OAuth) logins, and an OAuth login always talks to `https://api.anthropic.com`. `winddown_smoke.sh` therefore builds the checkout for Linux and runs it in a `golang` container with no network (`--network none`): `api.anthropic.com` resolves to the container's loopback, where `winddown_smoke.py` serves a fake HTTPS upstream with a certificate from a throwaway CA the proxy trusts through `SSL_CERT_FILE`. Two fake OAuth login files and a fake credit key (`fallback-when: limit`) stand in. Scenarios, each on a fresh proxy: both logins held (new prompt 429, running task served by a login with the note at the end of the last user message, exempt served, OpenAI-format running task served with the note); after the wind-down (`wind-down-minutes: 1`) running task 429, exempt served; both at a real limit (running task served by the credit key, no note); a drained credit key at priority 10 without `fallback-when` plus both held (new prompt 429; running task served by the drained key with the note); one login with room (new prompt and running task served, no note); restart (the held readings come back from the state file); the shared reserve (one login spent while the later one holds the reserve, the pool at the reserve with `Retry-After` at the 1% step, the near-reset and final-hour steps, explicit keys).
+The quota tests use a controllable clock and fake logins. A test binary never calls the real usage endpoint: without a test URL the read fails by design.
+
+Max logins are subscription (OAuth) logins, and an OAuth login always talks to `https://api.anthropic.com`. `winddown_smoke.sh` therefore builds the checkout for Linux and runs it in a `golang` container with no network (`--network none`): `api.anthropic.com` resolves to the container's loopback, where `winddown_smoke.py` serves a fake HTTPS upstream with a certificate from a throwaway CA the proxy trusts through `SSL_CERT_FILE`. Two fake OAuth login files and a fake credit key (`fallback-when: limit`) stand in. Scenarios, each on a fresh proxy: both logins held (new prompt 429, running task served by a login with the note at the end of the last user message, exempt served, OpenAI-format running task served with the note); after the wind-down (`wind-down-minutes: 1`) running task 429, exempt served; both at a real limit (running task served by the credit key, no note); a drained credit key at priority 10 without `fallback-when` plus both held (new prompt 429; running task served by the drained key with the note); one login with room (new prompt and running task served, no note); restart (the held readings come back from the state file); the shared reserve (one login spent while the later one holds the reserve, the pool at the reserve with `Retry-After` at the 1% step, the near-reset and final-hour steps, explicit keys); the usage read before the credit key (both logins at a real limit: a failed read, HTTP 500, changes nothing; no second read within 60 seconds; after 60 seconds the fake upstream reports one login as reset, its cooldown is lifted and it serves with no manual step; no read on the normal path); the usage read before a refusal (no credit key: the 429 names the weekly limit and its reset in text and headers, the quota state file carries the same sentence, and the reset login serves after the next read). The fake upstream serves the usage report at `GET /api/oauth/usage` and counts the reads per login. The two usage scenarios each wait about one minute. Every 429 a scenario receives is kept in `refusals.jsonl` in its run folder.
 
 `smoke.sh` runs on the host with fake API keys only. Since API keys are not Max logins, it checks that a `claude-api-key` at 0.97 is never reserve-held, plus the manual hold, hot reload, the Codex route and the state file across a restart.
 

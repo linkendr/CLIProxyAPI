@@ -62,7 +62,12 @@ type reserveReading struct {
 	utilization float64
 	resetAt     time.Time // zero if the response carried no reset
 	observedAt  time.Time
+	// source is reserveReadingFromUsage for a usage read; empty for response headers.
+	source string
 }
+
+// reserveReadingFromUsage marks a reading taken from Anthropic's usage report.
+const reserveReadingFromUsage = "usage"
 
 // reserveHold is the hold state of one window of one account.
 type reserveHold struct {
@@ -109,6 +114,13 @@ func (g *reserveGate) reserveAt(next, now time.Time) float64 {
 // latest), each taking up to its headroom, and reports per entry whether all its headroom
 // is reserve: held.
 func placeReserve(entries []reservePoolEntry, reserve float64) []bool {
+	held, _ := placeReserveShares(entries, reserve)
+	return held
+}
+
+// placeReserveShares is placeReserve that also returns the share of the reserve each
+// entry carries.
+func placeReserveShares(entries []reservePoolEntry, reserve float64) ([]bool, []float64) {
 	order := make([]int, len(entries))
 	for i := range order {
 		order[i] = i
@@ -125,13 +137,40 @@ func placeReserve(entries []reservePoolEntry, reserve float64) []bool {
 		}
 	})
 	held := make([]bool, len(entries))
+	shares := make([]float64, len(entries))
 	left := reserve
 	for _, i := range order {
 		share := math.Min(entries[i].headroom, math.Max(left, 0))
 		held[i] = entries[i].headroom <= share+reserveEpsilon
+		shares[i] = share
 		left -= share
 	}
-	return held
+	return held, shares
+}
+
+// nextReserveReset returns the earliest known reset among entries; zero if none is known.
+func nextReserveReset(entries []reservePoolEntry) time.Time {
+	var next time.Time
+	for _, entry := range entries {
+		if !entry.resetAt.IsZero() && (next.IsZero() || entry.resetAt.Before(next)) {
+			next = entry.resetAt
+		}
+	}
+	return next
+}
+
+// reserveEntryOf is the pool entry of a login with reading. A login at a real limit has
+// no headroom whatever its reading says; a reading whose reset has passed describes a
+// window that already rolled over, so it has all its headroom.
+func reserveEntryOf(id string, reading reserveReading, atLimit bool, now time.Time) reservePoolEntry {
+	entry := reservePoolEntry{id: id, headroom: math.Max(0, 1-reading.utilization), resetAt: reading.resetAt}
+	if !entry.resetAt.IsZero() && !entry.resetAt.After(now) {
+		entry.headroom, entry.resetAt = 1, time.Time{}
+	}
+	if atLimit {
+		entry.headroom = 0
+	}
+	return entry
 }
 
 // poolHolds decides the hold of every entry of one window. The reserve follows the time
@@ -139,12 +178,7 @@ func placeReserve(entries []reservePoolEntry, reserve float64) []bool {
 // held entry is released at the first limit step that frees it, else at that next reset;
 // its release is unknown when no entry has a known reset.
 func (g *reserveGate) poolHolds(entries []reservePoolEntry, now time.Time) []reserveHold {
-	var next time.Time
-	for _, entry := range entries {
-		if !entry.resetAt.IsZero() && (next.IsZero() || entry.resetAt.Before(next)) {
-			next = entry.resetAt
-		}
-	}
+	next := nextReserveReset(entries)
 	held := placeReserve(entries, g.reserveAt(next, now))
 	var steps []time.Time
 	if !next.IsZero() {
@@ -244,7 +278,7 @@ func (b *reserveHoldBook) mergeLocked(key reserveKey, live reserveReading, liveO
 	if !liveOK || (ok && live.observedAt.Before(reading.observedAt)) {
 		return reading, ok
 	}
-	if !ok || live.utilization != reading.utilization || !live.resetAt.Equal(reading.resetAt) {
+	if !ok || live.utilization != reading.utilization || !live.resetAt.Equal(reading.resetAt) || live.source != reading.source {
 		b.dirty = true
 	}
 	if b.readings == nil {
@@ -254,11 +288,46 @@ func (b *reserveHoldBook) mergeLocked(key reserveKey, live reserveReading, liveO
 	return live, true
 }
 
-// merge merges a live reading of one account window into the book.
-func (b *reserveHoldBook) merge(authID, window string, live reserveReading) {
+// merge merges a live reading of one account window into the book. It reports whether
+// the book's utilization or reset of that window changed.
+func (b *reserveHoldBook) merge(authID, window string, live reserveReading) bool {
+	key := reserveKey{authID: authID, window: window}
 	b.mu.Lock()
-	b.mergeLocked(reserveKey{authID: authID, window: window}, live, true)
+	defer b.mu.Unlock()
+	before, known := b.readings[key]
+	after, _ := b.mergeLocked(key, live, true)
+	return !known || after.utilization != before.utilization || !after.resetAt.Equal(before.resetAt)
+}
+
+// reading returns the book's reading of one account window.
+func (b *reserveHoldBook) reading(authID, window string) (reserveReading, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	reading, ok := b.readings[reserveKey{authID: authID, window: window}]
+	return reading, ok
+}
+
+// drop forgets every reading and hold of one account and writes the change to the state
+// file. A quota reset uses it: the readings describe the window before the reset.
+func (b *reserveHoldBook) drop(authID string, now time.Time) {
+	b.mu.Lock()
+	dropped := false
+	for _, window := range reserveWindows {
+		key := reserveKey{authID: authID, window: window}
+		if _, ok := b.readings[key]; ok {
+			delete(b.readings, key)
+			dropped = true
+		}
+		if _, ok := b.holds[key]; ok {
+			delete(b.holds, key)
+			dropped = true
+		}
+	}
+	persist := dropped && b.path != ""
 	b.mu.Unlock()
+	if persist {
+		b.save(now)
+	}
 }
 
 // evaluate merges the live readings of logins into the book and decides the hold of each
@@ -296,14 +365,7 @@ func (b *reserveHoldBook) evaluate(gate *reserveGate, now time.Time, logins []re
 				}
 				continue
 			}
-			entry := reservePoolEntry{id: login.id, headroom: math.Max(0, 1-reading.utilization), resetAt: reading.resetAt}
-			if !entry.resetAt.IsZero() && !entry.resetAt.After(now) {
-				entry.headroom, entry.resetAt = 1, time.Time{}
-			}
-			if login.atLimit {
-				entry.headroom = 0
-			}
-			keys, readings, entries = append(keys, key), append(readings, reading), append(entries, entry)
+			keys, readings, entries = append(keys, key), append(readings, reading), append(entries, reserveEntryOf(login.id, reading, login.atLimit, now))
 		}
 		for i, next := range gate.poolHolds(entries, now) {
 			key := keys[i]
@@ -607,17 +669,33 @@ type reserveHoldError struct {
 	// or a reset); zero if unknown.
 	resetAt time.Time
 	now     time.Time
+	// limited is set when every Max login is at a real limit (nameQuotaRefusal): the
+	// reserve is then not what refuses the caller, so the refusal names realLimit ("" if
+	// unknown) and resetAt is the reset of the login that serves again first.
+	limited   bool
+	realLimit string
+}
+
+// limit names what refuses the caller: the reserve, or the real limit behind it.
+func (e *reserveHoldError) limit() string {
+	if e.limited {
+		return e.realLimit
+	}
+	return quotaLimitReserve
 }
 
 func (e *reserveHoldError) message() string {
 	if e.manual {
 		return "quota reserve hold: interactive Claude use is paused by the operator (routing.reserve-gate.hold) to preserve quota for automations"
 	}
-	message := "quota reserve hold: interactive Claude use is paused to preserve quota for automations"
-	if !e.resetAt.IsZero() {
-		message += "; available again at " + formatReserveReset(e.resetAt)
+	return quotaRefusalSentence(e.limit(), e.resetAt, time.Local) + quotaRefusalCountdown(e.resetAt, e.clock())
+}
+
+func (e *reserveHoldError) clock() time.Time {
+	if e.now.IsZero() {
+		return time.Now()
 	}
-	return message
+	return e.now
 }
 
 // Error returns an Anthropic error body so Claude clients show the message as is.
@@ -633,17 +711,15 @@ func (e *reserveHoldError) StatusCode() int { return http.StatusTooManyRequests 
 
 func (e *reserveHoldError) IsRequestStop() bool { return true }
 
-// Headers returns Retry-After and the unified rate-limit headers Claude Code reads to
-// show when the limit resets. A manual hold has no reset, so it sends none.
+// Headers returns Retry-After and the unified rate-limit headers a Claude Code session
+// with a subscription login reads to show when the limit resets: it reports the reset
+// and the limit type only when the representative claim is present. A manual hold has
+// no reset, so it sends none.
 func (e *reserveHoldError) Headers() http.Header {
 	if e.resetAt.IsZero() {
 		return nil
 	}
-	now := e.now
-	if now.IsZero() {
-		now = time.Now()
-	}
-	seconds := int64(math.Ceil(e.resetAt.Sub(now).Seconds()))
+	seconds := int64(math.Ceil(e.resetAt.Sub(e.clock()).Seconds()))
 	if seconds < 1 {
 		seconds = 1
 	}
@@ -651,6 +727,9 @@ func (e *reserveHoldError) Headers() http.Header {
 	headers.Set("Retry-After", strconv.FormatInt(seconds, 10))
 	headers.Set("anthropic-ratelimit-unified-status", "rejected")
 	headers.Set("anthropic-ratelimit-unified-reset", strconv.FormatInt(e.resetAt.Unix(), 10))
+	if claim := quotaRefusalClaim(e.limit()); claim != "" {
+		headers.Set("anthropic-ratelimit-unified-representative-claim", claim)
+	}
 	return headers
 }
 

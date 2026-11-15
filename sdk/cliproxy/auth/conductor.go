@@ -231,6 +231,10 @@ type Manager struct {
 	reserveHolds reserveHoldBook
 	// reserveTrigger keeps when every Max login first became held (in memory only).
 	reserveTrigger reserveTriggerClock
+	// quotaUsage limits the on-demand usage reads of the Max logins.
+	quotaUsage quotaUsageReader
+	// quotaState writes the quota state file.
+	quotaState quotaStateWriter
 
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider

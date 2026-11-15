@@ -34,6 +34,7 @@ type reserveStateWindow struct {
 	ObservedAt  time.Time `json:"observed_at"`
 	Held        bool      `json:"held,omitempty"`
 	HeldUntil   int64     `json:"held_until,omitempty"` // Unix seconds the hold lifts (a limit step or the reset); 0 if unknown
+	Source      string    `json:"source,omitempty"`     // "usage" for a usage read; empty for response headers
 }
 
 // reserveStatePath returns the state file of an enabled gate: state-file, or
@@ -95,6 +96,9 @@ func (b *reserveHoldBook) useStateFile(path string, now time.Time) {
 				continue
 			}
 			reading := reserveReading{utilization: entry.Utilization, resetAt: unixOrZero(entry.ResetAt), observedAt: entry.ObservedAt}
+			if entry.Source == reserveReadingFromUsage {
+				reading.source = reserveReadingFromUsage
+			}
 			if !reading.resetAt.IsZero() && !reading.resetAt.After(now) {
 				continue
 			}
@@ -141,7 +145,7 @@ func (b *reserveHoldBook) save(now time.Time) {
 		if !reading.resetAt.IsZero() && !reading.resetAt.After(now) {
 			continue
 		}
-		entry := reserveStateWindow{Utilization: reading.utilization, ResetAt: unixOrZeroOf(reading.resetAt), ObservedAt: reading.observedAt.UTC()}
+		entry := reserveStateWindow{Utilization: reading.utilization, ResetAt: unixOrZeroOf(reading.resetAt), ObservedAt: reading.observedAt.UTC(), Source: reading.source}
 		if hold, held := b.holds[key]; held && hold.held {
 			entry.Held, entry.HeldUntil = true, unixOrZeroOf(hold.until)
 		}
@@ -164,7 +168,12 @@ func writeReserveStateFile(path string, file reserveStateFile) error {
 	if errMarshal != nil {
 		return errMarshal
 	}
-	data = append(data, '\n')
+	return writeStateFileAtomic(path, append(data, '\n'))
+}
+
+// writeStateFileAtomic replaces path with data: a temp file in the same directory, mode
+// 0600, synced, then renamed over path.
+func writeStateFileAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	if errMkdir := os.MkdirAll(dir, 0o700); errMkdir != nil {
 		return errMkdir

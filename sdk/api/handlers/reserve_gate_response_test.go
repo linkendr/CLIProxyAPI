@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -94,7 +95,15 @@ func TestReserveGateHoldReachesClientAs429(t *testing.T) {
 	if errJSON := json.Unmarshal(recorder.Body.Bytes(), &body); errJSON != nil {
 		t.Fatalf("body %q: %v", recorder.Body.String(), errJSON)
 	}
-	if body.Error.Type != "rate_limit_error" || !strings.Contains(body.Error.Message, "quota reserve hold") || !strings.Contains(body.Error.Message, reset.Add(-time.Hour).UTC().Format(time.RFC3339)) {
-		t.Fatalf("body = %s, want rate_limit_error naming the hold and its release", recorder.Body.String())
+	release := reset.Add(-time.Hour).In(time.Local).Format("Mon 2 Jan 15:04")
+	if body.Error.Type != "rate_limit_error" || !strings.HasPrefix(body.Error.Message, "Quota reserve hold:") || !strings.Contains(body.Error.Message, "Next release "+release+".") {
+		t.Fatalf("body = %s, want rate_limit_error naming the hold and its release in local time (%s)", recorder.Body.String(), release)
+	}
+	// T3 Code reads the reset of the refused turn from this countdown.
+	if !regexp.MustCompile(`\(reset after (1h 59m \d+s|2h 0m 0s)\)$`).MatchString(body.Error.Message) {
+		t.Fatalf("message %q does not end with the countdown to the release", body.Error.Message)
+	}
+	if got := recorder.Header().Get("Anthropic-Ratelimit-Unified-Representative-Claim"); got != "seven_day" {
+		t.Fatalf("representative claim header = %q, want seven_day", got)
 	}
 }

@@ -86,6 +86,13 @@ type modelCooldownError struct {
 	resetAt  time.Time
 	provider string
 	cause    error
+	// limited is set when a cooled Max login is behind the refusal (nameQuotaRefusal):
+	// the message then names limit ("" if unknown) and its reset limitResetAt, as seen
+	// at now.
+	limited      bool
+	limit        string
+	limitResetAt time.Time
+	now          time.Time
 }
 
 // NewModelCooldownError creates an error representing model-level cooldown.
@@ -129,6 +136,9 @@ func (e *modelCooldownError) Error() string {
 	message := fmt.Sprintf("All credentials for model %s are cooling down", modelName)
 	if e.provider != "" {
 		message = fmt.Sprintf("%s via provider %s", message, e.provider)
+	}
+	if e.limited {
+		message = quotaRefusalSentence(e.limit, e.limitResetAt, time.Local) + quotaRefusalCountdown(e.limitResetAt, e.now)
 	}
 	resetSeconds := int(math.Ceil(e.resetIn.Seconds()))
 	if resetSeconds < 0 {
@@ -360,13 +370,19 @@ func (e *modelCooldownError) Headers() http.Header {
 		resetSeconds = 0
 	}
 	headers.Set("Retry-After", strconv.Itoa(resetSeconds))
-	// Claude Code builds rate_limit_event.resetsAt from these two headers.
+	// A Claude Code session with a subscription login reads the reset from these headers.
 	resetAt := e.resetAt
 	if resetAt.IsZero() {
 		resetAt = time.Now().Add(e.resetIn)
 	}
+	if e.limited && !e.limitResetAt.IsZero() {
+		resetAt = e.limitResetAt
+	}
 	headers.Set("anthropic-ratelimit-unified-status", "rejected")
 	headers.Set("anthropic-ratelimit-unified-reset", strconv.FormatInt(resetAt.Unix(), 10))
+	if claim := quotaRefusalClaim(e.limit); e.limited && claim != "" {
+		headers.Set("anthropic-ratelimit-unified-representative-claim", claim)
+	}
 	return headers
 }
 

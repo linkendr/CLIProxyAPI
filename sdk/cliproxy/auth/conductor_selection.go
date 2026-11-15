@@ -2441,7 +2441,51 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	return authCopy, executor, providerKey, nil
 }
 
+// pickNextMixed selects the credential of one attempt. At a quota dead end, where no Max
+// login can serve the caller, it first reads the real usage of the Max logins
+// (refreshQuotaUsage) and selects once more if that lifted a cooldown or changed a
+// reading: a limit the owner reset upstream is then seen without a manual step. A
+// cooldown refusal behind a cooled Max login names the limit and its reset. Home owns
+// the credentials under Home dispatch, so nothing is read there.
 func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
+	auth, executor, provider, errPick := m.pickNextMixedOnce(ctx, providers, model, opts, tried)
+	if m.HomeEnabled() || !quotaDeadEnd(auth, providers, errPick) {
+		return auth, executor, provider, errPick
+	}
+	if m.refreshQuotaUsage(ctx) {
+		auth, executor, provider, errPick = m.pickNextMixedOnce(ctx, providers, model, opts, tried)
+	}
+	now := time.Now()
+	errPick = m.nameQuotaRefusal(errPick, model, now)
+	m.syncQuotaState(now)
+	return auth, executor, provider, errPick
+}
+
+// quotaDeadEnd reports whether a selection ended where no Max login can serve the
+// caller: a reserve hold refusal (not the manual hold, which no reading lifts), a
+// cooldown refusal on a route that includes Claude, or a Claude credit key
+// (fallback-when) about to serve.
+func quotaDeadEnd(selected *Auth, providers []string, errPick error) bool {
+	if errPick == nil {
+		return selected != nil && isClaudeAuth(selected) && authFallbackWhen(selected) != ""
+	}
+	var holdErr *reserveHoldError
+	if errors.As(errPick, &holdErr) && holdErr != nil {
+		return !holdErr.manual
+	}
+	var cooldownErr *modelCooldownError
+	if !errors.As(errPick, &cooldownErr) || cooldownErr == nil {
+		return false
+	}
+	for _, provider := range providers {
+		if canonicalSchedulingProvider(provider) == "claude" {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) pickNextMixedOnce(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	opts.EnsureMetadata()
 	clearSchedulerSelectionID(opts.Metadata)
 	if m.HomeEnabled() {

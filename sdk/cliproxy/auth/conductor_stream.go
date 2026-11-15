@@ -672,7 +672,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			remaining = closedCh
 		}
 		attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, execModel, aliasResult)
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, routeModel, streamResult.Headers, buffered, remaining, attemptAliasResult, ephemeralResult, execOpts, executionSeq), nil
+		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, routeModel, m.withMaxPoolHeaders(auth, streamResult.Headers, time.Now()), buffered, remaining, attemptAliasResult, ephemeralResult, execOpts, executionSeq), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}

@@ -175,7 +175,7 @@ api-keys:
         else:
             ok = ok and routes == expected_routes
         if reserve:
-            ok = ok and "quota reserve hold" in body
+            ok = ok and "quota reserve hold" in body.lower()
         if not ok:
             raise AssertionError(f"{name}: HTTP {status} routes {routes}, expected {expected_status} {expected_routes}: {body}")
         retry = headers.get("Retry-After")

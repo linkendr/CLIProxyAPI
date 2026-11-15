@@ -10,6 +10,10 @@ HTTP fake (credit: fallback-when limit; drained: priority 10 without fallback-wh
 credit expiry drain leaves a key). The fake upstream reports only the 7d window, as Anthropic
 does now. Held readings are seeded through the gate's state file. Each scenario runs a
 fresh proxy in a fresh folder.
+
+The fake upstream also serves the usage report of a login (GET /api/oauth/usage), which the
+proxy reads when no Max login can serve a caller. It reports what the fake holds for that
+login unless a scenario makes it fail, and it counts the reads per login.
 """
 
 import argparse
@@ -17,6 +21,7 @@ import http.server
 import json
 import os
 import pathlib
+import re
 import socket
 import ssl
 import subprocess
@@ -29,6 +34,11 @@ MODEL = "claude-sonnet-4-6"
 NOTE = ("Quota reserve reached. Finish the current step, write a short status of what is done "
         "and what is left, and end your turn. Do not start new tool calls or subagents.")
 LIMIT_RETRY_SECONDS = 11
+USAGE_PATH = "/api/oauth/usage?cedar_ember=1&skip_spend=1"
+USAGE_BETA = "oauth-2025-04-20"
+USAGE_READ_SECONDS = 60  # the proxy reads one login's usage at most once in this time
+# The pattern T3 Code 0.1.9 reads the reset time of a refusal from.
+RESET_AFTER = re.compile(r"\(reset after (?:(\d+)h ?)?(?:(\d+)m ?)?(?:(\d+)s)?\)")
 HOUR = 3600
 DAY = 24 * HOUR
 TOOLS = [{"name": "Bash", "description": "Run a command", "input_schema": {"type": "object", "properties": {}}}]
@@ -73,11 +83,27 @@ class Upstream:
         self.max = {}
         self.credit_empty = False
         self.hits = []  # (route, request body)
+        self.usage_fail = set()  # logins whose usage read answers HTTP 500
+        self.usage_hits = []  # (login, path, anthropic-beta header)
         self.lock = threading.Lock()
         upstream = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
+                if self.path.startswith("/api/oauth/usage"):
+                    name = self.headers.get("authorization", "").rsplit("-", 1)[-1]
+                    with upstream.lock:
+                        upstream.usage_hits.append((name, self.path, self.headers.get("anthropic-beta", "")))
+                        state, failing = upstream.max.get(name), name in upstream.usage_fail
+                    if state is None or failing:
+                        self.reply(500, {"type": "error", "error": {"type": "api_error", "message": "usage unavailable"}}, {})
+                        return
+                    usage, reset = state["7d"]
+                    percent = 100.0 if state["limited"] else round(usage * 100, 6)
+                    stamp = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(reset))
+                    self.reply(200, {"five_hour": None, "seven_day": {"utilization": percent, "resets_at": stamp},
+                                     "limits": [{"kind": "weekly_all", "percent": percent, "resets_at": stamp}]}, {})
+                    return
                 # OAuth profile lookups, should the proxy make one.
                 self.reply(200, {"account": {"uuid": "00000000-0000-4000-8000-000000000000", "email": "x@example.invalid"},
                                  "organization": {"uuid": "00000000-0000-4000-8000-000000000001", "name": "smoke"}}, {})
@@ -170,12 +196,24 @@ class Upstream:
             self.max = {name: {"7d": (0.10, int(time.time()) + 2 * DAY), "limited": False} for name in maxes}
             self.credit_empty = False
             self.hits.clear()
+            self.usage_fail = set()
+            self.usage_hits.clear()
+
+    def usage_reads(self):
+        """Usage reads so far per login; every read must be the documented request."""
+        counts = {}
+        with self.lock:
+            for name, path, beta in self.usage_hits:
+                if path != USAGE_PATH or beta != USAGE_BETA:
+                    raise AssertionError(f"usage read of {name}: GET {path} anthropic-beta {beta!r}")
+                counts[name] = counts.get(name, 0) + 1
+        return counts
 
 
 class Fixture:
     """One proxy over the shared fake upstream with two OAuth Max logins and a credit key."""
 
-    def __init__(self, binary, run, upstream, ca, seed=None, drained=False, wind_down=None, gate_lines=""):
+    def __init__(self, binary, run, upstream, ca, seed=None, drained=False, wind_down=None, gate_lines="", credit=True):
         self.binary, self.run, self.upstream, self.ca = binary, run, upstream, ca
         run.mkdir(parents=True)
         (run / "auth").mkdir()
@@ -200,6 +238,16 @@ class Fixture:
         - name: "{MODEL}"
 """ if drained else ""
         wind = (f"    wind-down-minutes: {wind_down}\n" if wind_down is not None else "") + gate_lines
+        credit_entry = f"""    - name: credit-fake
+      base-url: "{upstream.base}/credit"
+      priority: -10
+      fallback-when: limit
+      keys:
+        - api-key: "credit-upstream-fake"
+      models:
+        - name: "{MODEL}"
+""" if credit else ""
+        keys = f"api-keys:\n  claude:\n{drained_entry}{credit_entry}" if drained or credit else ""
         self.config = run / "config.yaml"
         self.config.write_text(f"""config-version: 8
 server:
@@ -218,17 +266,7 @@ routing:
     enabled: true
     threshold: 0.95
     exempt-api-keys: [winddown-automation-fake]
-{wind}api-keys:
-  claude:
-{drained_entry}    - name: credit-fake
-      base-url: "{upstream.base}/credit"
-      priority: -10
-      fallback-when: limit
-      keys:
-        - api-key: "credit-upstream-fake"
-      models:
-        - name: "{MODEL}"
-""")
+{wind}{keys}""")
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.logs = []
         self.start()
@@ -282,6 +320,28 @@ routing:
         self.log.flush()
         return "".join(path.read_text(errors="replace") for path in self.logs)
 
+    def quota_state(self, want):
+        """The quota state file once want(document) holds. It must be private and name no
+        login by token, email or file name."""
+        path = self.run / "home" / ".local" / "state" / "cliproxyapi" / "quota-state.json"
+        text, doc = "", None
+        for _ in range(50):
+            try:
+                text = path.read_text()
+                doc = json.loads(text)
+            except (OSError, ValueError):
+                doc = None
+            if doc is not None and want(doc):
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError(f"quota state file never matched: {text[:1200]}")
+        mode = path.stat().st_mode & 0o777
+        leaks = [word for word in ("fake", "example.invalid", "maxa", "maxb", "sk-ant") if word in text]
+        if doc.get("schema") != "cliproxy.quota_state.v1" or mode != 0o600 or leaks:
+            raise AssertionError(f"quota state file: schema {doc.get('schema')}, mode {oct(mode)}, leaks {leaks}")
+        return doc
+
     def request(self, body, automation=False, path="/v1/messages"):
         key = "winddown-automation-fake" if automation else "winddown-user-fake"
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", method="POST",
@@ -303,13 +363,16 @@ routing:
         status, text, headers = self.request(body, automation, path)
         hits = self.upstream.hits[before:]
         routes = [route for route, _ in hits]
+        if status == 429:  # keep every refusal as the client received it
+            with (self.run / "refusals.jsonl").open("a") as out:
+                out.write(json.dumps({"check": name, "status": status, "headers": dict(headers.items()), "body": text}) + "\n")
         ok = status == expected_status if expected_status else status != 200
         if isinstance(expected_routes, set):
             ok = ok and not expected_routes.intersection(routes)
         else:
             ok = ok and routes == expected_routes
         if reserve:
-            ok = ok and "quota reserve hold" in text
+            ok = ok and "quota reserve hold" in text.lower()
         detail = ""
         if note is not None and ok:
             payload = hits[-1][1]
@@ -518,6 +581,126 @@ def near_reset_limits(binary, run, upstream, ca):
         f.stop()
 
 
+def retry_days(route):
+    """Days from now until the route's retry_at; 0 without one."""
+    if not route.get("retry_at"):
+        return 0
+    return (time.mktime(time.strptime(route["retry_at"], "%Y-%m-%dT%H:%M:%SZ")) - time.mktime(time.gmtime())) / DAY
+
+
+def wait_for_next_usage_read(first_read):
+    wait = first_read + USAGE_READ_SECONDS + 1 - time.time()
+    if wait > 0:
+        print(f"... waiting {wait:.0f}s until the proxy may read usage again", flush=True)
+        time.sleep(wait)
+
+
+def usage_read_before_credit(binary, run, upstream, ca):
+    """(h) both logins at a real limit, credit key configured. A failed usage read changes
+    nothing; usage is read once per login in 60 s; once the fake upstream reports maxa as
+    reset, the next read lifts its cooldown and maxa serves again with no manual step."""
+    now = int(time.time())
+    f = Fixture(binary, run, upstream, ca)
+    try:
+        upstream.max["maxa"].update({"7d": (1.0, now + 2 * DAY), "limited": True})
+        upstream.max["maxb"].update({"7d": (1.0, now + 3 * DAY), "limited": True})
+        upstream.usage_fail = {"maxa", "maxb"}
+        status, _, _ = f.request(NEW_PROMPT, automation=True)
+        first_read = time.time()
+        routes = [route for route, _ in upstream.hits]
+        if status != 200 or routes[-1:] != ["credit"] or not {"maxa", "maxb"} <= set(routes):
+            raise AssertionError(f"exempt request did not record both limits: {status} {routes}")
+        if upstream.usage_reads() != {"maxa": 1, "maxb": 1}:
+            raise AssertionError(f"usage reads before the credit fallback: {upstream.usage_reads()}")
+        print(f"PASS (h) both limits recorded via {routes}; usage read once per login before the credit key served,"
+              " both reads failed (HTTP 500)", flush=True)
+        f.check("(h) failed usage read changes nothing: new prompt 200 by the credit key", NEW_PROMPT, 200, ["credit"])
+        doc = f.quota_state(lambda d: d["interactive"]["route"] == "credit")
+        states = sorted(login["state"] for login in doc["logins"])
+        if states != ["cooled", "cooled"] or doc["interactive"]["limit"] != "weekly_all" or retry_days(doc["interactive"]) < 1:
+            raise AssertionError(f"quota state after the failed read: {doc}")
+        print(f"PASS (h) quota state file: interactive route credit, limit weekly_all, both logins cooled,"
+              f" retry in {retry_days(doc['interactive']):.1f} days", flush=True)
+
+        # The owner resets maxa on Anthropic's side: the upstream serves it and reports 2%.
+        upstream.max["maxa"] = {"7d": (0.02, now + 7 * DAY), "limited": False}
+        upstream.usage_fail = set()
+        f.check("(h) maxa reset upstream, under 60 s since the last read: still the credit key", NEW_PROMPT, 200, ["credit"])
+        if upstream.usage_reads() != {"maxa": 1, "maxb": 1}:
+            raise AssertionError(f"usage read again within {USAGE_READ_SECONDS} s: {upstream.usage_reads()}")
+        print(f"PASS (h) no second usage read within {USAGE_READ_SECONDS} s: {upstream.usage_reads()}", flush=True)
+        wait_for_next_usage_read(first_read)
+        doc = f.quota_state(lambda d: d["interactive"]["route"] == "credit")
+        if retry_days(doc["interactive"]) < 1:
+            raise AssertionError(f"cooldown ended by itself, the scenario proves nothing: {doc['interactive']}")
+        f.check("(h) after 60 s: usage read lifts maxa's cooldown, new prompt 200 by maxa, no manual step",
+                NEW_PROMPT, 200, ["maxa"])
+        if upstream.usage_reads() != {"maxa": 2, "maxb": 2}:
+            raise AssertionError(f"usage reads after the limit passed: {upstream.usage_reads()}")
+        f.check("(h) normal path: new prompt 200 by maxa", NEW_PROMPT, 200, ["maxa"])
+        if upstream.usage_reads() != {"maxa": 2, "maxb": 2}:
+            raise AssertionError(f"usage read on the normal path: {upstream.usage_reads()}")
+        doc = f.quota_state(lambda d: d["interactive"]["route"] == "max")
+        states = sorted(login["state"] for login in doc["logins"])
+        if states != ["cooled", "ok"] or doc["interactive"]["limit"] or doc["interactive"]["message"]:
+            raise AssertionError(f"quota state after the recovery: {doc}")
+        print(f"PASS (h) no usage read on the normal path: {upstream.usage_reads()}; quota state file: interactive"
+              " route max, one login ok, one cooled", flush=True)
+    finally:
+        f.stop()
+
+
+def usage_read_before_refusal(binary, run, upstream, ca):
+    """(i) both logins at a real limit, no credit key. The refusal names the limit and the
+    reset in the text and the headers; once the fake upstream reports maxb as reset, the
+    read before the next refusal lifts its cooldown and maxb serves."""
+    now = int(time.time())
+    f = Fixture(binary, run, upstream, ca, credit=False)
+    try:
+        upstream.max["maxa"].update({"7d": (1.0, now + 2 * DAY), "limited": True})
+        upstream.max["maxb"].update({"7d": (1.0, now + 3 * DAY), "limited": True})
+        status, _, _ = f.request(NEW_PROMPT)
+        routes = [route for route, _ in upstream.hits]
+        if status != 429 or set(routes) != {"maxa", "maxb"}:
+            raise AssertionError(f"first request did not record both limits: {status} {routes}")
+        print(f"PASS (i) both limits recorded via {routes}: the upstream's own 429 is passed on", flush=True)
+        _, text, headers = f.check("(i) both limited, no credit key: new prompt 429, no upstream call", NEW_PROMPT, 429, [])
+        first_read = time.time()
+        if upstream.usage_reads() != {"maxa": 1, "maxb": 1}:
+            raise AssertionError(f"usage reads before the refusal: {upstream.usage_reads()}")
+        print("PASS (i) usage read once per login before the proxy's refusal, both still full", flush=True)
+        countdown = RESET_AFTER.search(text)
+        reset = int(headers.get("Anthropic-Ratelimit-Unified-Reset", "0"))
+        retry = int(headers.get("Retry-After", "0"))
+        if ("Weekly limit. Next reset " not in text or "A Fable reset does not lift it." not in text or not countdown
+                or countdown.group(1) not in ("47", "48") or abs(reset - (now + 2 * DAY)) > 120 or abs(retry - 2 * DAY) > 120
+                or headers.get("Anthropic-Ratelimit-Unified-Status") != "rejected"
+                or headers.get("Anthropic-Ratelimit-Unified-Representative-Claim") != "seven_day"):
+            raise AssertionError(f"refusal does not name the limit and maxa's reset: {text[:400]} {dict(headers)}")
+        sentence = text[text.index("Weekly limit."):text.index(" (reset after")]
+        print(f"PASS (i) refusal text: {sentence} {countdown.group(0)}; Retry-After {retry},"
+              f" unified reset {reset - now} s from now, claim seven_day", flush=True)
+        doc = f.quota_state(lambda d: d["interactive"]["route"] == "refused")
+        if doc["interactive"]["message"] != sentence or doc["interactive"]["limit"] != "weekly_all":
+            raise AssertionError(f"quota state message differs from the refusal: {doc['interactive']} vs {sentence!r}")
+        print("PASS (i) quota state file: interactive route refused, limit weekly_all, the refusal's own sentence", flush=True)
+
+        upstream.max["maxb"] = {"7d": (0.05, now + 7 * DAY), "limited": False}
+        f.check("(i) maxb reset upstream, under 60 s since the last read: still 429", NEW_PROMPT, 429, [])
+        if upstream.usage_reads() != {"maxa": 1, "maxb": 1}:
+            raise AssertionError(f"usage read again within {USAGE_READ_SECONDS} s: {upstream.usage_reads()}")
+        print(f"PASS (i) no second usage read within {USAGE_READ_SECONDS} s: {upstream.usage_reads()}", flush=True)
+        wait_for_next_usage_read(first_read)
+        f.check("(i) after 60 s: usage read lifts maxb's cooldown, new prompt 200 by maxb, no manual step",
+                NEW_PROMPT, 200, ["maxb"])
+        if upstream.usage_reads() != {"maxa": 2, "maxb": 2}:
+            raise AssertionError(f"usage reads after the limit passed: {upstream.usage_reads()}")
+        f.quota_state(lambda d: d["interactive"]["route"] == "max")
+        print(f"PASS (i) usage reads {upstream.usage_reads()}; quota state file: interactive route max", flush=True)
+    finally:
+        f.stop()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=pathlib.Path, required=True)
@@ -538,6 +721,8 @@ def main():
     drained_key(binary, run / "d-drained-key", upstream, ca)
     trigger_off(binary, run / "e-trigger-off", upstream, ca)
     near_reset_limits(binary, run / "g-near-reset", upstream, ca)
+    usage_read_before_credit(binary, run / "h-usage-credit", upstream, ca)
+    usage_read_before_refusal(binary, run / "i-usage-refusal", upstream, ca)
     print("ALL PASS: reserve wind-down through real HTTP with fake OAuth logins", flush=True)
 
 
