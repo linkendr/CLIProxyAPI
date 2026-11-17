@@ -250,7 +250,8 @@ func quotaStateTime(t time.Time) *time.Time {
 // A login is cooled while it has a live quota cooldown, credential-wide or of one model;
 // with every login cooled, the routes describe the model that is limited. The
 // interactive route differs from the automation route only through the reserve gate:
-// the manual hold, or every login held while not every login is at a real limit.
+// the manual hold, every login held while not every login is at a real limit, or a
+// credit key, which serves automations only.
 func (m *Manager) buildQuotaState(now time.Time) (quotaStateDoc, bool) {
 	type maxLogin struct {
 		index    string
@@ -376,6 +377,8 @@ func (m *Manager) buildQuotaState(now time.Time) (quotaStateDoc, bool) {
 		if since := m.reserveTrigger.start(); !since.IsZero() && gate.windDown > 0 && since.Add(gate.windDown).After(now) {
 			doc.Interactive.WindDownUntil = quotaStateTime(since.Add(gate.windDown))
 		}
+	case doc.Interactive.Route == quotaRouteCredit:
+		doc.Interactive.Route = quotaRouteRefused
 	}
 	return doc, true
 }

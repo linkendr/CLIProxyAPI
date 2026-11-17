@@ -446,32 +446,129 @@ func TestReserveGateLimitedLoginWithoutReadingHasNoRoom(t *testing.T) {
 	})
 }
 
-// Case 4: both Max logins really at their limit: everyone, the ordinary caller included,
-// gets the credit key. A reserve hold alone never lets the credit key serve.
-func TestReserveGateCreditKeyServesNonExemptCallerOnlyAtRealLimit(t *testing.T) {
+// requireCreditKeyForExemptCallerOnly checks the credit rule in a state where the credit
+// key may serve: the exempt caller gets it, the ordinary caller gets a 429.
+func requireCreditKeyForExemptCallerOnly(t *testing.T, rig *reserveRig) error {
+	t.Helper()
+	auth, err := rig.pick(reserveTestExemptKey, "s-exempt", reserveTestClaudeModel)
+	if err != nil || auth.ID != rig.credit {
+		t.Fatalf("exempt pick = %v, %v; want credit key %s", auth, err, rig.credit)
+	}
+	auth, err = rig.pick(reserveTestUserKey, "s-user", reserveTestClaudeModel)
+	if err == nil {
+		t.Fatalf("ordinary pick = %s, want a refusal: credit keys serve exempt callers only", auth.ID)
+	}
+	if got := statusCodeFromError(err); got != http.StatusTooManyRequests {
+		t.Fatalf("ordinary refusal status = %d (%v), want 429", got, err)
+	}
+	return err
+}
+
+// Case 4: both Max logins really at their limit: the exempt caller gets the credit key,
+// the ordinary caller the limit's refusal. A reserve hold alone never lets the credit
+// key serve.
+func TestReserveGateCreditKeyServesExemptCallerOnlyAtRealLimit(t *testing.T) {
 	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
 		rig.observe(t, rig.a, "7d", 0.98, time.Now().Add(48*time.Hour))
 		rig.observe(t, rig.b, "7d", 0.99, time.Now().Add(25*time.Hour))
 		_, err := rig.pick(reserveTestUserKey, "s0", reserveTestClaudeModel)
 		requireReserveHold(t, err)
 		rig.limitAt(t, rig.a, time.Now().Add(48*time.Hour))
-		rig.limitAt(t, rig.b, time.Now().Add(time.Hour))
-		for _, key := range []string{reserveTestExemptKey, reserveTestUserKey} {
-			auth, errPick := rig.pick(key, "s-"+key, reserveTestClaudeModel)
-			if errPick != nil || auth.ID != rig.credit {
-				t.Fatalf("pick for %q with both accounts limited = %v, %v; want credit key %s", key, auth, errPick, rig.credit)
-			}
+		first := time.Now().Add(time.Hour).Truncate(time.Second)
+		rig.limitAt(t, rig.b, first)
+		err = requireCreditKeyForExemptCallerOnly(t, rig)
+		var hold *reserveHoldError
+		if !errors.As(err, &hold) {
+			t.Fatalf("ordinary refusal = %v (%T), want the hold of the limited logins", err, err)
+		}
+		// The request path names the real limit and the login that serves again first.
+		if want := quotaRefusalSentence(quotaLimitWeeklyAll, rig.auth(rig.b).Quota.NextRecoverAt, time.Local); rig.mixed && !strings.Contains(err.Error(), want) {
+			t.Fatalf("ordinary refusal = %v, want %q", err, want)
 		}
 	})
 }
 
 // The same with cooldowns that carried no reading.
-func TestReserveGateCreditKeyServesWhenBothCoolWithoutReadings(t *testing.T) {
+func TestReserveGateCreditKeyServesExemptCallerOnlyWhenBothCoolWithoutReadings(t *testing.T) {
 	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
 		rig.coolDown(t, rig.a, rig.b)
-		auth, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
-		if err != nil || auth.ID != rig.credit {
-			t.Fatalf("pick = %v, %v; want credit key %s", auth, err, rig.credit)
+		requireCreditKeyForExemptCallerOnly(t, rig)
+	})
+}
+
+// limitModelOnBoth records one model's weekly limit on both Max logins, while the shared
+// window has room: the reserve trigger stays off.
+func (r *reserveRig) limitModelOnBoth(t *testing.T) {
+	t.Helper()
+	for _, id := range []string{r.a, r.b} {
+		headers := unifiedHeaders(map[string]float64{"7d": 0.30}, time.Now().Add(48*time.Hour))
+		headers.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		headers.Set("Anthropic-Ratelimit-Unified-7d_oi-Status", "rejected")
+		r.limitModel(t, id, headers)
+	}
+}
+
+// One model's weekly limit on every Max login: the ordinary caller gets the model's
+// limit, not the credit key, although the reserve trigger is off.
+func TestReserveGateCreditKeyServesExemptCallerOnlyAtModelLimit(t *testing.T) {
+	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
+		rig.limitModelOnBoth(t)
+		err := requireCreditKeyForExemptCallerOnly(t, rig)
+		var cooldown *modelCooldownError
+		if !errors.As(err, &cooldown) {
+			t.Fatalf("ordinary refusal = %v (%T), want the model's cooldown", err, err)
+		}
+	})
+}
+
+// A request of an ordinary caller never reaches the credit key's upstream, with retry
+// rounds configured too.
+func TestReserveGateCreditKeyNotExecutedForOrdinaryCaller(t *testing.T) {
+	limits := map[string]func(t *testing.T, rig *reserveRig){
+		"weekly limit": func(t *testing.T, rig *reserveRig) {
+			rig.limitAt(t, rig.a, time.Now().Add(48*time.Hour))
+			rig.limitAt(t, rig.b, time.Now().Add(time.Hour))
+		},
+		"model limit": func(t *testing.T, rig *reserveRig) { rig.limitModelOnBoth(t) },
+	}
+	for name, selector := range reserveSelectors() {
+		for limit, cool := range limits {
+			t.Run(name+", "+limit, func(t *testing.T) {
+				rig := newReserveRig(t, selector(), true, reserveGateOn(nil))
+				rig.manager.SetRetryConfig(3, 30*time.Second, 0)
+				cool(t, rig)
+				ctx := context.Background()
+				req := cliproxyexecutor.Request{Model: reserveTestClaudeModel}
+				_, errExec := rig.manager.Execute(ctx, []string{"claude"}, req, reserveOpts(reserveTestUserKey, ""))
+				_, errStream := rig.manager.ExecuteStream(ctx, []string{"claude"}, req, reserveOpts(reserveTestUserKey, ""))
+				_, errCount := rig.manager.ExecuteCount(ctx, []string{"claude"}, req, reserveOpts(reserveTestUserKey, ""))
+				for what, err := range map[string]error{"Execute": errExec, "ExecuteStream": errStream, "ExecuteCount": errCount} {
+					if got := statusCodeFromError(err); err == nil || got != http.StatusTooManyRequests {
+						t.Fatalf("%s for the ordinary caller = %v (status %d), want 429", what, err, got)
+					}
+				}
+				if calls := rig.calls.Load(); calls != 0 {
+					t.Fatalf("executor called %d times for the ordinary caller", calls)
+				}
+				resp, errExempt := rig.manager.Execute(ctx, []string{"claude"}, req, reserveOpts(reserveTestExemptKey, ""))
+				if errExempt != nil || string(resp.Payload) != rig.credit {
+					t.Fatalf("exempt Execute = %q, %v; want the credit key", resp.Payload, errExempt)
+				}
+			})
+		}
+	}
+}
+
+// With the gate off no caller is exempt or ordinary, so the credit key serves any caller
+// under its fallback-when rule alone.
+func TestReserveGateDisabledCreditKeyServesAnyCaller(t *testing.T) {
+	forEachReserveRig(t, internalconfig.ReserveGateConfig{}, func(t *testing.T, rig *reserveRig) {
+		rig.coolDown(t, rig.a, rig.b)
+		for _, key := range []string{reserveTestExemptKey, reserveTestUserKey} {
+			auth, err := rig.pick(key, "", reserveTestClaudeModel)
+			if err != nil || auth.ID != rig.credit {
+				t.Fatalf("pick for %q with the gate off = %v, %v; want credit key %s", key, auth, err, rig.credit)
+			}
 		}
 	})
 }

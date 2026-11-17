@@ -21,8 +21,8 @@ const ReserveWindDownNote = "Quota reserve reached. Finish the current step, wri
 
 // ReserveWindDownNoteApplies reports whether the request in meta is a wind-down request
 // and auth is a credential the gate would have refused it: a Claude credential that is
-// not a paid credit key with fallback-when. A credit key serving under its own rule (every
-// Max login at a real limit) would serve a new prompt too, so it gets no note.
+// not a paid credit key with fallback-when. A credit key serves exempt callers only, and
+// their requests are never wind-down requests, so it gets no note.
 func ReserveWindDownNoteApplies(auth *Auth, meta map[string]any) bool {
 	if auth == nil || meta == nil {
 		return false

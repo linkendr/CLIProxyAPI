@@ -58,7 +58,7 @@ func TestCreditKeyResponseCarriesMaxPoolHeaders(t *testing.T) {
 					}
 				}
 			}
-			resp, err = rig.manager.Execute(ctx, []string{"claude"}, req, reserveOpts(reserveTestUserKey, ""))
+			resp, err = rig.manager.Execute(ctx, []string{"claude"}, req, reserveOpts(reserveTestExemptKey, ""))
 			if err != nil || string(resp.Payload) != rig.credit {
 				t.Fatalf("Execute with both logins limited = %q, %v; want the credit key", resp.Payload, err)
 			}

@@ -477,9 +477,10 @@ def limited_and_held(binary, run, upstream, ca):
 
 
 def both_limited(binary, run, upstream, ca):
-    """(c) both logins at a real limit: running task served by the credit key, no note; new
-    prompt served by it too (its own fallback-when rule). Then an empty credit balance is
-    refused and the key cools down."""
+    """(c) both logins at a real limit: the ordinary caller's running task and new prompt
+    get the weekly limit's 429 and never the credit key, in the wind-down too; the exempt
+    caller is served by the credit key, no note. Then an empty credit balance is refused
+    and the key cools down."""
     now = int(time.time())
     f = Fixture(binary, run, upstream, ca)
     try:
@@ -490,11 +491,17 @@ def both_limited(binary, run, upstream, ca):
         if status != 200 or routes[-1:] != ["credit"] or not {"maxa", "maxb"} <= set(routes):
             raise AssertionError(f"exempt request did not record both limits: {status} {routes}")
         print(f"PASS (c) exempt request recorded both real limits via {routes}", flush=True)
-        f.check("(c) both limited: running task 200 by the credit key, no note", RUNNING_TASK, 200, ["credit"], note=False)
-        f.check("(c) both limited: new prompt 200 by the credit key", NEW_PROMPT, 200, ["credit"], note=False)
+        for name, body in (("running task", RUNNING_TASK), ("new prompt", NEW_PROMPT)):
+            _, text, _ = f.check(f"(c) both limited: ordinary {name} 429, no upstream call, no credit key", body, 429, [])
+            if "Weekly limit. Next reset " not in text:
+                raise AssertionError(f"(c) ordinary {name} refusal does not name the weekly limit: {text[:400]}")
+        f.check("(c) both limited: exempt running task 200 by the credit key, no note", RUNNING_TASK, 200, ["credit"],
+                automation=True, note=False)
+        f.check("(c) both limited: exempt new prompt 200 by the credit key", NEW_PROMPT, 200, ["credit"],
+                automation=True, note=False)
         upstream.credit_empty = True
-        f.check("(c) empty credit balance refused", RUNNING_TASK, None, ["credit"])
-        f.check("(c) empty credit key cools down", RUNNING_TASK, None, {"credit"})
+        f.check("(c) empty credit balance refused", RUNNING_TASK, None, ["credit"], automation=True)
+        f.check("(c) empty credit key cools down", RUNNING_TASK, None, {"credit"}, automation=True)
     finally:
         f.stop()
 
@@ -614,25 +621,28 @@ def usage_read_before_credit(binary, run, upstream, ca):
             raise AssertionError(f"usage reads before the credit fallback: {upstream.usage_reads()}")
         print(f"PASS (h) both limits recorded via {routes}; usage read once per login before the credit key served,"
               " both reads failed (HTTP 500)", flush=True)
-        f.check("(h) failed usage read changes nothing: new prompt 200 by the credit key", NEW_PROMPT, 200, ["credit"])
-        doc = f.quota_state(lambda d: d["interactive"]["route"] == "credit")
+        f.check("(h) failed usage read changes nothing: exempt new prompt 200 by the credit key", NEW_PROMPT, 200, ["credit"],
+                automation=True)
+        doc = f.quota_state(lambda d: d["automation"]["route"] == "credit")
         states = sorted(login["state"] for login in doc["logins"])
-        if states != ["cooled", "cooled"] or doc["interactive"]["limit"] != "weekly_all" or retry_days(doc["interactive"]) < 1:
+        if (states != ["cooled", "cooled"] or doc["automation"]["limit"] != "weekly_all" or retry_days(doc["automation"]) < 1
+                or doc["interactive"]["route"] != "refused" or doc["interactive"]["limit"] != "weekly_all"):
             raise AssertionError(f"quota state after the failed read: {doc}")
-        print(f"PASS (h) quota state file: interactive route credit, limit weekly_all, both logins cooled,"
-              f" retry in {retry_days(doc['interactive']):.1f} days", flush=True)
+        print(f"PASS (h) quota state file: automation route credit, interactive route refused, limit weekly_all,"
+              f" both logins cooled, retry in {retry_days(doc['automation']):.1f} days", flush=True)
 
         # The owner resets maxa on Anthropic's side: the upstream serves it and reports 2%.
         upstream.max["maxa"] = {"7d": (0.02, now + 7 * DAY), "limited": False}
         upstream.usage_fail = set()
-        f.check("(h) maxa reset upstream, under 60 s since the last read: still the credit key", NEW_PROMPT, 200, ["credit"])
+        f.check("(h) maxa reset upstream, under 60 s since the last read: still the credit key", NEW_PROMPT, 200, ["credit"],
+                automation=True)
         if upstream.usage_reads() != {"maxa": 1, "maxb": 1}:
             raise AssertionError(f"usage read again within {USAGE_READ_SECONDS} s: {upstream.usage_reads()}")
         print(f"PASS (h) no second usage read within {USAGE_READ_SECONDS} s: {upstream.usage_reads()}", flush=True)
         wait_for_next_usage_read(first_read)
-        doc = f.quota_state(lambda d: d["interactive"]["route"] == "credit")
-        if retry_days(doc["interactive"]) < 1:
-            raise AssertionError(f"cooldown ended by itself, the scenario proves nothing: {doc['interactive']}")
+        doc = f.quota_state(lambda d: d["automation"]["route"] == "credit")
+        if retry_days(doc["automation"]) < 1:
+            raise AssertionError(f"cooldown ended by itself, the scenario proves nothing: {doc['automation']}")
         f.check("(h) after 60 s: usage read lifts maxa's cooldown, new prompt 200 by maxa, no manual step",
                 NEW_PROMPT, 200, ["maxa"])
         if upstream.usage_reads() != {"maxa": 2, "maxb": 2}:

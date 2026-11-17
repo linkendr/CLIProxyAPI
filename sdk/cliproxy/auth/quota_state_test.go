@@ -196,7 +196,7 @@ func TestQuotaStateHomePathLogsMissingHome(t *testing.T) {
 // What a new prompt gets, per kind of caller, in each state of the Max logins.
 func TestQuotaStateRoutes(t *testing.T) {
 	reset := time.Now().Add(48 * time.Hour).Truncate(time.Second)
-	t.Run("credit key serves at a real limit", func(t *testing.T) {
+	t.Run("credit key serves the automation at a real limit", func(t *testing.T) {
 		path := quotaStateTestFile(t)
 		rig := newReserveRig(t, &RoundRobinSelector{}, true, reserveGateOn(nil))
 		rig.limitAt(t, rig.a, reset)
@@ -204,10 +204,14 @@ func TestQuotaStateRoutes(t *testing.T) {
 		doc, _ := readQuotaStateFile(t, path)
 		first := rig.auth(rig.a).Quota.NextRecoverAt
 		sentence := quotaRefusalSentence(quotaLimitWeeklyAll, first, time.Local)
-		for name, route := range map[string]quotaStateRoute{"interactive": doc.Interactive, "automation": doc.Automation} {
-			if route.Route != "credit" || route.Limit != "weekly_all" || route.RetryAt == nil || !route.RetryAt.Equal(first.Truncate(time.Second)) ||
+		for _, tc := range []struct {
+			caller, want string
+			route        quotaStateRoute
+		}{{"interactive", "refused", doc.Interactive}, {"automation", "credit", doc.Automation}} {
+			route := tc.route
+			if route.Route != tc.want || route.Limit != "weekly_all" || route.RetryAt == nil || !route.RetryAt.Equal(first.Truncate(time.Second)) ||
 				route.Message != sentence || route.WindDownUntil != nil {
-				t.Fatalf("%s = %+v, want credit until %s with %q", name, route, first, sentence)
+				t.Fatalf("%s = %+v, want %s until %s with %q", tc.caller, route, tc.want, first, sentence)
 			}
 		}
 		for _, login := range doc.Logins {
@@ -298,6 +302,13 @@ func TestQuotaStateRoutes(t *testing.T) {
 			if login.State != "ok" {
 				t.Fatalf("login = %+v, want ok", login)
 			}
+		}
+
+		// With the gate off the credit key serves every caller, so both routes say so.
+		rig.limitAt(t, rig.a, reset)
+		rig.limitAt(t, rig.b, reset)
+		if doc, _ = readQuotaStateFile(t, path); doc.Interactive.Route != "credit" || doc.Automation.Route != "credit" {
+			t.Fatalf("with the gate off and both logins limited: %+v / %+v, want credit", doc.Interactive, doc.Automation)
 		}
 	})
 
