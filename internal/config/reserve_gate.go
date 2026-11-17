@@ -37,10 +37,11 @@ const (
 // that reset last, and a login is held when all its headroom is reserve. Callers that
 // are not exempt are kept off held logins only while every Max login is held (or at a
 // real upstream limit); while one still has room, they may use any of them. Paid credit
-// keys (fallback-when) serve those callers only under their own fallback-when rule, and
-// Hold pauses every Claude credential for them. While every Max login is held, a running
-// task (the request answers a tool call) of such a caller is still served for
-// WindDownMinutes, with a note asking the model to wrap up; new prompts are refused.
+// keys (fallback-when) never serve those callers: they serve exempt callers only, under
+// their own fallback-when rule. Hold pauses every Claude credential for callers that are
+// not exempt. While every Max login is held, a running task (the request answers a tool
+// call) of such a caller is still served for WindDownMinutes, with a note asking the
+// model to wrap up; new prompts are refused.
 // Other providers and exempt callers are unaffected. Enabled false means no change at all.
 type ReserveGateConfig struct {
 	// Enabled turns the gate on. Default false.

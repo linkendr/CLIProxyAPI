@@ -879,7 +879,8 @@ upstream:
 #           # broader form: it also serves while every higher-priority credential is blocked credential-wide by a
 #           # quota cooldown (shared 5h or 7d window), so the key covers all models it supports whenever the primary
 #           # login is out of quota and hands traffic back as soon as the login recovers; disabled, unauthorized,
-#           # erroring (non-quota) or healthy peers still keep it unused. Pair it with a
+#           # erroring (non-quota) or healthy peers still keep it unused. While routing.reserve-gate is enabled,
+#           # a fallback-when key serves only the callers in its exempt-api-keys. Pair it with a
 #           # lower priority and a models list limited to the models you want it to cover. Omit for ordinary priority
 #           # selection; any other value is a configuration error.
 #           # fallback-when: model-limit   # or: limit

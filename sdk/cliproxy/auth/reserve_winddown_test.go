@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -254,19 +255,24 @@ func TestReserveWindDownClockStartsFromRecordedResponse(t *testing.T) {
 	}
 }
 
-// Both Max logins at a real limit: a running task is served by the credit key under its
-// own fallback-when rule, without the note (a new prompt is served by it as well).
-func TestReserveWindDownBothLimitedUsesCreditKey(t *testing.T) {
+// Both Max logins at a real limit: the wind-down does not open the credit key to an
+// ordinary caller. Its running task is refused like its new prompt; the exempt caller is
+// served by the credit key.
+func TestReserveWindDownBothLimitedKeepsCreditKeyForExemptCaller(t *testing.T) {
 	forEachReserveRig(t, reserveGateOn(nil), func(t *testing.T, rig *reserveRig) {
 		rig.limitAt(t, rig.a, time.Now().Add(48*time.Hour))
 		rig.limitAt(t, rig.b, time.Now().Add(time.Hour))
 		for _, body := range []string{reserveTestRunningTask, reserveTestNewPrompt} {
-			auth, meta, err := rig.pickWith(reserveRequestOpts(reserveTestUserKey, body))
+			auth, _, err := rig.pickWith(reserveRequestOpts(reserveTestUserKey, body))
+			if err == nil || statusCodeFromError(err) != http.StatusTooManyRequests {
+				t.Fatalf("ordinary pick with both limited = %v, %v; want a 429 and no credit key", auth, err)
+			}
+			auth, meta, err := rig.pickWith(reserveRequestOpts(reserveTestExemptKey, body))
 			if err != nil || auth.ID != rig.credit {
-				t.Fatalf("pick with both limited = %v, %v; want credit key", auth, err)
+				t.Fatalf("exempt pick with both limited = %v, %v; want credit key", auth, err)
 			}
 			if ReserveWindDownNoteApplies(auth, meta) {
-				t.Fatal("credit key serving under its own rule gets the note")
+				t.Fatal("credit key gets the note")
 			}
 		}
 	})

@@ -2347,6 +2347,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
 	reserve := m.reserveCheckFor(opts)
+	creditWithheld := m.reserveWithholdsCredit(opts.Metadata)
 	var reserveGated []*Auth
 	pluginScheduler, schedulerAcross := m.snapshotPluginScheduler()
 
@@ -2393,6 +2394,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
+		if creditWithheld && isClaudeCreditKey(candidate) {
+			continue
+		}
 		_, used := tried[candidate.ID]
 		gated := reserve.blocks(candidate)
 		// Pinning restricts selection, not the eligible pool used for accounting;
@@ -2435,13 +2439,6 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	)
 	if len(candidates) > 0 {
 		available, selectorAuths, errAvailable = m.availableAuthsForSelector(ctx, selector, candidates, provider, model, now, schedulerAcross, opts.Headers)
-		if errAvailable != nil && len(reserveGated) > 0 && onlyCreditCandidates(candidates) {
-			// The reserve gate removed every Max login and no credit key may serve yet: the
-			// caller gets the reserve hold, not the credit keys' unavailability.
-			errHold := reserve.holdError(reserveGated)
-			m.mu.RUnlock()
-			return nil, nil, errHold
-		}
 		if errAvailable != nil && !canInspectUnavailableAffinity {
 			m.mu.RUnlock()
 			m.warnLogAuthUnavailable(ctx, []string{provider}, model, opts, tried, errAvailable)
@@ -2854,6 +2851,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
 	reserve := m.reserveCheckFor(opts)
+	creditWithheld := m.reserveWithholdsCredit(opts.Metadata)
 	var reserveGated []*Auth
 
 	providerSet := make(map[string]struct{}, len(providers))
@@ -2916,6 +2914,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
+		if creditWithheld && isClaudeCreditKey(candidate) {
+			continue
+		}
 		_, used := tried[candidate.ID]
 		gated := reserve.blocks(candidate)
 		// Pinning restricts selection, not the eligible pool used for accounting;
@@ -2958,11 +2959,6 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	)
 	if len(candidates) > 0 {
 		available, selectorAuths, errAvailable = m.availableAuthsForSelector(ctx, selector, candidates, "mixed", model, now, schedulerAcross, opts.Headers)
-		if errAvailable != nil && len(reserveGated) > 0 && onlyCreditCandidates(candidates) {
-			errHold := reserve.holdError(reserveGated)
-			m.mu.RUnlock()
-			return nil, nil, "", errHold
-		}
 		if errAvailable != nil && !canInspectUnavailableAffinity {
 			m.mu.RUnlock()
 			m.warnLogAuthUnavailable(ctx, providers, model, opts, tried, errAvailable)

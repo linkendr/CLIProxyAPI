@@ -487,10 +487,12 @@ type reserveCheck struct {
 //
 // While the trigger is on, a caller that is not exempt gets:
 //   - a new prompt: refused (every Max login held, every other Claude credential without
-//     fallback-when blocked; credit keys only under their own fallback-when rule);
-//   - a running task, for windDown after the trigger turned on: served like an exempt
-//     caller (Max logins up to their real limits, then credit keys at a real limit);
+//     fallback-when blocked);
+//   - a running task, for windDown after the trigger turned on: served by the Max logins
+//     up to their real limits;
 //   - a running task after that: refused like a new prompt.
+//
+// Credit keys never serve such a caller (reserveWithholdsCredit).
 func (m *Manager) reserveCheckFor(opts cliproxyexecutor.Options) *reserveCheck {
 	delete(opts.Metadata, ReserveWindDownMetadataKey)
 	check := m.reserveCallerCheck(opts.Metadata)
@@ -525,6 +527,21 @@ func (m *Manager) reserveCallerCheck(meta map[string]any) *reserveCheck {
 		return nil
 	}
 	return &reserveCheck{gate: gate, book: &m.reserveHolds, now: time.Now()}
+}
+
+// reserveWithholdsCredit reports whether the paid credit keys are kept from the caller in
+// meta: the gate is on and the caller is not exempt. Credit keys are a reserve for
+// automations, so for any other caller they are not candidates, in the wind-down too: at
+// a limit of the Max logins that caller gets the limit's refusal. Under the manual hold
+// the gate refuses them with every other Claude credential (blocks).
+func (m *Manager) reserveWithholdsCredit(meta map[string]any) bool {
+	check := m.reserveCallerCheck(meta)
+	return check != nil && !check.gate.hold
+}
+
+// isClaudeCreditKey reports whether auth is a paid Claude credit key (fallback-when).
+func isClaudeCreditKey(auth *Auth) bool {
+	return isClaudeAuth(auth) && authFallbackWhen(auth) != ""
 }
 
 // reserveMaxLogins captures the readings and real-limit state of every Max login. It
@@ -604,9 +621,9 @@ func (c *reserveCheck) accountHold(auth *Auth) reserveAccount {
 // login and every Claude credential that is neither a Max login nor a credit key with
 // fallback-when (an API key the credit expiry drain moved to the front). While one Max
 // login still has room, nothing is blocked: the caller may use a held login up to its
-// real limit. A paid credit key (fallback-when) is not blocked: its own fallback-when
-// rule decides, and it serves only once every Max login is really at a limit. A reserve
-// hold is not such a limit. Other providers are never blocked.
+// real limit. A paid credit key (fallback-when) is blocked only by the manual hold: the
+// pick paths drop it for this caller before they ask (reserveWithholdsCredit). Other
+// providers are never blocked.
 func (c *reserveCheck) blocks(auth *Auth) bool {
 	if c == nil || auth == nil || !isClaudeAuth(auth) {
 		return false

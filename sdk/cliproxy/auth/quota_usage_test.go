@@ -287,7 +287,7 @@ func TestQuotaUsageLiftsCooldownBeforeCreditFallback(t *testing.T) {
 		rig.limitAt(t, rig.a, time.Now().Add(48*time.Hour))
 		rig.limitAt(t, rig.b, time.Now().Add(72*time.Hour))
 		usage.report(1.0, time.Now().Add(48*time.Hour), rig.a, rig.b)
-		auth, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
+		auth, err := rig.pick(reserveTestExemptKey, "", reserveTestClaudeModel)
 		if err != nil || auth.ID != rig.credit {
 			t.Fatalf("pick with both logins still at their limit = %v, %v; want credit key", auth, err)
 		}
@@ -427,7 +427,7 @@ func TestQuotaUsageFailedReadChangesNothing(t *testing.T) {
 			before, _ := rig.manager.reserveHolds.reading(rig.a, "7d")
 			setup(t, rig, usage)
 
-			auth, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
+			auth, err := rig.pick(reserveTestExemptKey, "", reserveTestClaudeModel)
 			if err != nil || auth.ID != rig.credit {
 				t.Fatalf("pick = %v, %v; want the credit key as before", auth, err)
 			}
@@ -573,7 +573,7 @@ func TestQuotaUsageReadLimit(t *testing.T) {
 		}
 	}
 	for i := 0; i < 5; i++ {
-		if auth, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel); err != nil || auth.ID != rig.credit {
+		if auth, err := rig.pick(reserveTestExemptKey, "", reserveTestClaudeModel); err != nil || auth.ID != rig.credit {
 			t.Fatalf("pick #%d = %v, %v", i, auth, err)
 		}
 	}
@@ -588,7 +588,7 @@ func TestQuotaUsageReadLimit(t *testing.T) {
 
 	// The upstream reset inside the 60 seconds is seen by the first request after them.
 	usage.report(0.01, time.Time{}, rig.a, rig.b)
-	if auth, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel); err != nil || auth.ID != rig.credit {
+	if auth, err := rig.pick(reserveTestExemptKey, "", reserveTestClaudeModel); err != nil || auth.ID != rig.credit {
 		t.Fatalf("pick inside the 60 seconds = %v, %v; want the credit key", auth, err)
 	}
 	requireReads(2)
@@ -918,7 +918,7 @@ func TestQuotaUsageMalformedValueKeepsCooldown(t *testing.T) {
 			cool(t, rig, rig.a)
 			cool(t, rig, rig.b)
 			requests := rig.serveUsage(t, body)
-			auth, err := rig.pick(reserveTestUserKey, "", reserveTestClaudeModel)
+			auth, err := rig.pick(reserveTestExemptKey, "", reserveTestClaudeModel)
 			if requests.Load() == 0 {
 				t.Fatal("no usage read before the fallback")
 			}
