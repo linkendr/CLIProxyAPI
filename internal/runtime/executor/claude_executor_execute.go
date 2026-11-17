@@ -174,7 +174,6 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// Cloaking and ensureCacheControl may push the total over 4 when the client
 	// already sends multiple cache_control blocks.
 	enforceCacheControlLimitDoc(doc, 4)
-	stripPromptCacheOptionsDoc(doc)
 
 	// Native selects the 1h cache pool only for OAuth credentials and pairs it with
 	// extended-cache-ttl-2025-04-11, which claudeCodeCLIBetas emits on exactly the
@@ -248,6 +247,8 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		finalizeClaudeCompactionSummaryBodyDoc(doc)
 	}
 	applyClaudePreservedThinkingBindingDoc(doc)
+	// Keep built-in cleanup before the final user payload rules.
+	stripPromptCacheOptionsDoc(doc)
 	// The reserve gate's wrap-up note is the last built-in injection, so no later rewrite
 	// moves it off the end of the last user message; the user rules below still win.
 	if errNote := helps.ApplyClaudeReserveWindDownNoteDoc(doc, auth, opts.Metadata); errNote != nil {
@@ -263,7 +264,6 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		diagnosticsState = claudeDiagnosticsRequestState{}
 	}
 	extraBetas, _ = extractAndRemoveBetasDoc(doc)
-	stripPromptCacheOptionsDoc(doc)
 	bodyForUpstream := doc.Bytes()
 	body = bodyForUpstream
 	bodyForTranslation := bodyForUpstream
