@@ -156,7 +156,7 @@ The proxy writes what it knows to a small file for other tools on the host.
 ```
 
 - `interactive` is a caller whose key is not on `exempt-api-keys`; `automation` is an exempt caller. Each says what a new prompt gets now.
-- `route`: `max` (a Max login serves), `credit` (a credit key serves) or `refused` (HTTP 429). While the gate is enabled `interactive` is never `credit`: where `automation` is `credit`, `interactive` is `refused` with the same limit, `retry_at` and message. `since`: when the route last changed, as far as this process saw.
+- `route`: `max` (a Max login serves), `credit` (a credit key serves) or `refused` (HTTP 429). While the gate is enabled `interactive` is never `credit`: where `automation` is `credit`, `interactive` is `refused` with the same limit, `retry_at` and message, except under `hold: true`, where `interactive` is `refused` with limit `reserve`, no `retry_at` and the hold message. `since`: when the route last changed, as far as this process saw.
 - `limit`: `weekly_all`, `weekly_scoped`, `five_hour`, `reserve` or empty. `retry_at`: when the route is expected to return to `max`.
 - `wind_down_until`: set while running tasks are still served after new prompts are refused.
 - `message`: the refusal's sentence without the countdown; empty when the route is `max`.
