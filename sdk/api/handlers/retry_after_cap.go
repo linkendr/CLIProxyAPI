@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/httpwire"
 )
 
 var clientRetryAfterCapSeconds atomic.Int64
@@ -90,4 +91,19 @@ func (w *retryAfterCapWriter) Flush() {
 	w.ResponseWriter.Flush()
 }
 
-var _ http.Flusher = (*retryAfterCapWriter)(nil)
+// FlushError flushes through the wrapped writer and returns its transport error, so a streaming
+// handler still detects a disconnected client.
+func (w *retryAfterCapWriter) FlushError() error {
+	w.capHeader()
+	return httpwire.FlushResponse(w.ResponseWriter)
+}
+
+// Unwrap lets http.ResponseController reach the wrapped writer.
+func (w *retryAfterCapWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+var (
+	_ http.Flusher  = (*retryAfterCapWriter)(nil)
+	_ http.Hijacker = (*retryAfterCapWriter)(nil)
+)
