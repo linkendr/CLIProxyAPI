@@ -290,6 +290,13 @@ routing:
     # Set to 0 to keep the legacy 60-second cooldown; set to -1 to disable transient error cooldowns.
     transient-error-cooldown-seconds: 0
 
+    # Upper bound in seconds for the Retry-After header on OpenAI-compatible responses
+    # (/v1/chat/completions, /v1/completions, /v1/responses and related routes, including
+    # streaming and the Responses websocket error event). Clients such as OpenCode sleep for the
+    # whole Retry-After value, so a multi-day cooldown looks like a hang. 0 disables the cap.
+    # Claude routes (/v1/messages) always keep the real value. The error body keeps the real reset time.
+    max-client-retry-after-seconds: 0
+
 # Shared request/response behavior.
 requests:
   # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
