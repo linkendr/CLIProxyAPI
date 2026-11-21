@@ -107,6 +107,11 @@ type Config struct {
 	// 0 keeps the legacy default cooldown. Negative values disable these cooldowns.
 	TransientErrorCooldownSeconds int `yaml:"transient-error-cooldown-seconds" json:"transient-error-cooldown-seconds"`
 
+	// MaxClientRetryAfterSeconds caps the Retry-After header on OpenAI-compatible responses
+	// (/v1/chat/completions, /v1/completions, /v1/responses and related routes). 0 disables the cap.
+	// Claude routes always keep the real value. The error body keeps the real reset time.
+	MaxClientRetryAfterSeconds int `yaml:"max-client-retry-after-seconds" json:"max-client-retry-after-seconds"`
+
 	// AuthAutoRefreshWorkers overrides the size of the core auth auto-refresh and manual refresh-all worker pool.
 	// When <= 0, the default worker count is used.
 	AuthAutoRefreshWorkers int `yaml:"auth-auto-refresh-workers" json:"auth-auto-refresh-workers"`

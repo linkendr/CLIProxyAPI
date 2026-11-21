@@ -765,6 +765,14 @@ func websocketJSONPayloadsFromChunk(chunk []byte) [][]byte {
 	return payloads
 }
 
+// capWebsocketRetryAfter applies the configured client Retry-After cap to a websocket error header.
+func capWebsocketRetryAfter(key, value string) string {
+	if http.CanonicalHeaderKey(key) != "Retry-After" {
+		return value
+	}
+	return handlers.CapClientRetryAfter(value)
+}
+
 func buildResponsesWebsocketErrorPayload(errMsg *interfaces.ErrorMessage) ([]byte, error) {
 	status := http.StatusInternalServerError
 	errText := http.StatusText(status)
@@ -804,7 +812,7 @@ func buildResponsesWebsocketErrorPayload(errMsg *interfaces.ErrorMessage) ([]byt
 				continue
 			}
 			headerPath := strings.ReplaceAll(strings.ReplaceAll(key, `\\`, `\\\\`), ".", `\\.`)
-			if errSet := headersDoc.Set(headerPath, values[0]); errSet != nil {
+			if errSet := headersDoc.Set(headerPath, capWebsocketRetryAfter(key, values[0])); errSet != nil {
 				return nil, errSet
 			}
 			hasHeaders = true
@@ -817,7 +825,7 @@ func buildResponsesWebsocketErrorPayload(errMsg *interfaces.ErrorMessage) ([]byt
 				continue
 			}
 			headerPath := strings.ReplaceAll(strings.ReplaceAll(key, `\\`, `\\\\`), ".", `\\.`)
-			if errSet := headersDoc.Set(headerPath, values[0]); errSet != nil {
+			if errSet := headersDoc.Set(headerPath, capWebsocketRetryAfter(key, values[0])); errSet != nil {
 				return nil, errSet
 			}
 			hasHeaders = true
