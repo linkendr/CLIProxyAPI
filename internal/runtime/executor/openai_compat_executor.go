@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -1301,7 +1302,15 @@ func (e statusErr) Error() string {
 	}
 	return fmt.Sprintf("status %d", e.code)
 }
-func (e statusErr) Unwrap() error              { return e.cause }
+func (e statusErr) Unwrap() error { return e.cause }
+
+// Is compares by value: the rateLimitHeaders map makes statusErr incomparable
+// with ==, which would otherwise break errors.Is against a wrapped statusErr cause.
+func (e statusErr) Is(target error) bool {
+	t, ok := target.(statusErr)
+	return ok && reflect.DeepEqual(e, t)
+}
+
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
 func (e statusErr) IsRequestScoped() bool      { return e.requestScoped }
