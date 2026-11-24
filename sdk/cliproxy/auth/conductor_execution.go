@@ -1288,6 +1288,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		execCtx = m.WithAuthTransport(execCtx, auth)
+		execCtx = m.withAntigravityModelState(execCtx, auth)
 		execCtx = contextWithRequestedModelAlias(execCtx, pickOpts, routeModel)
 		execCtx = coreusage.WithSelectionID(execCtx, selectionIDFromOptions(pickOpts))
 		execCtx = m.newUpstreamAttemptContext(execCtx)
@@ -1590,6 +1591,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		execCtx = m.WithAuthTransport(execCtx, auth)
+		execCtx = m.withAntigravityModelState(execCtx, auth)
 		execCtx = contextWithRequestedModelAlias(execCtx, pickOpts, routeModel)
 		execCtx = coreusage.WithSelectionID(execCtx, selectionIDFromOptions(pickOpts))
 		execCtx = m.newUpstreamAttemptContext(execCtx)
@@ -2018,6 +2020,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 		}
 		execCtx = m.WithAuthTransport(execCtx, auth)
+		execCtx = m.withAntigravityModelState(execCtx, auth)
 		// Enrich before auth preparation so prepare-stage usage records observe the client request.
 		if homeMode {
 			clearSchedulerSelectionID(opts.Metadata)
