@@ -34,6 +34,10 @@ func authFallbackWhen(auth *Auth) string {
 	}
 }
 
+// authFallbackWhenModelLimit reports whether auth is a conditional fallback. Such a
+// credential needs the manager-level view of its higher-priority peers, which the
+// scheduler fast path does not have, so routeAwareSelectionRequired sends it to the
+// legacy pick.
 func authFallbackWhenModelLimit(auth *Auth) bool {
 	return authFallbackWhen(auth) != ""
 }
@@ -41,6 +45,10 @@ func authFallbackWhenModelLimit(auth *Auth) bool {
 // filterConditionalFallbacks drops the conditional fallbacks in auths that are not
 // eligible for routeModel. It returns auths unchanged when none is present. The caller
 // must hold m.mu.
+//
+// An ineligible conditional fallback behaves as if it were not configured: the
+// availability error reflects only the credentials that can serve the model, and a
+// stale session-affinity binding to it is not kept as "transiently unavailable".
 func (m *Manager) filterConditionalFallbacks(auths []*Auth, routeModel string, now time.Time) []*Auth {
 	hasFallback := false
 	for _, candidate := range auths {

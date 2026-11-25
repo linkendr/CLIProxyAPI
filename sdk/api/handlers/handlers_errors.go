@@ -124,15 +124,10 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 		return
 	}
 	if msg != nil && msg.Error != nil {
-		for key, values := range coreauth.SafeResponseHeaders(msg.Error) {
-			if !coreauth.IsRateLimitResponseHeader(key) {
-				continue
-			}
-			c.Writer.Header().Del(key)
-			for _, value := range values {
-				c.Writer.Header().Add(key, value)
-			}
+		for _, value := range coreauth.SafeResponseHeaders(msg.Error).Values("Retry-After") {
+			c.Writer.Header().Add("Retry-After", value)
 		}
+		EchoRateLimitHeaders(c.Writer.Header(), coreauth.SafeResponseHeaders(msg.Error))
 	}
 	if msg != nil && msg.Addon != nil && PassthroughHeadersEnabled(h.CurrentConfig()) {
 		for key, values := range msg.Addon {
