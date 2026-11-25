@@ -885,7 +885,7 @@ func reasoningEffortFromConfig(config ThinkingConfig) string {
 	case ModeAuto:
 		return string(LevelAuto)
 	case ModeLevel:
-		return strings.ToLower(strings.TrimSpace(string(config.Level)))
+		return strings.Clone(strings.ToLower(strings.TrimSpace(string(config.Level))))
 	case ModeBudget:
 		level, ok := ConvertBudgetToLevel(config.Budget)
 		if !ok {
@@ -1073,12 +1073,14 @@ func extractOpenAIConfig(body []byte) ThinkingConfig {
 func extractOpenAIConfigFromGetter(get func(string) ojson.Result) ThinkingConfig {
 	if effort := get("reasoning_effort"); effort.Exists() {
 		value := effort.String()
-		if value == "none" {
-			return ThinkingConfig{Mode: ModeNone, Budget: 0}
+		if strings.TrimSpace(value) != "" {
+			if value == "none" {
+				return ThinkingConfig{Mode: ModeNone, Budget: 0}
+			}
+			return ThinkingConfig{Mode: ModeLevel, Level: ThinkingLevel(value)}
 		}
-		return ThinkingConfig{Mode: ModeLevel, Level: ThinkingLevel(value)}
 	}
-	return ThinkingConfig{}
+	return extractOpenAIGoogleThinkingFallbackConfigFromGetter(get)
 }
 
 func extractKimiConfig(body []byte) ThinkingConfig {
