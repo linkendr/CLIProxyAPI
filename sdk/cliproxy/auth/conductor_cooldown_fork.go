@@ -12,8 +12,9 @@ import (
 // the on-demand usage reads and the quota state file. conductor.go and
 // conductor_cooldown.go keep one-line calls into this file.
 
-// managerQuota is the fork's part of Manager, embedded as its first field so upstream's
-// field list stays as upstream has it.
+// managerQuota is the fork's part of Manager, embedded in its own block after
+// runtimeConfig so upstream's field lines stay as upstream has them. Not at the top:
+// upstream adds Manager fields there (inFlightTracker, 2026-11-15).
 type managerQuota struct {
 	// reserveGate is routing.reserve-gate compiled from runtimeConfig; nil when disabled.
 	reserveGate atomic.Pointer[reserveGate]

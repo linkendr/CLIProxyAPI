@@ -195,8 +195,6 @@ type resultPolicyHolder struct {
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
-	managerQuota
-
 	inFlightTracker           *inFlightTracker
 	store                     Store
 	cooldownStore             CooldownStateStore
@@ -253,6 +251,8 @@ type Manager struct {
 	// runtimeConfig stores the latest application config for request-time decisions.
 	// It is initialized in NewManager; never Load() before first Store().
 	runtimeConfig atomic.Value
+
+	managerQuota
 
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
