@@ -252,16 +252,7 @@ type Manager struct {
 	// It is initialized in NewManager; never Load() before first Store().
 	runtimeConfig atomic.Value
 
-	// reserveGate is routing.reserve-gate compiled from runtimeConfig; nil when disabled.
-	reserveGate atomic.Pointer[reserveGate]
-	// reserveHolds keeps the reserve gate's readings and holds per account window.
-	reserveHolds reserveHoldBook
-	// reserveTrigger keeps when every Max login first became held (in memory only).
-	reserveTrigger reserveTriggerClock
-	// quotaUsage limits the on-demand usage reads of the Max logins.
-	quotaUsage quotaUsageReader
-	// quotaState writes the quota state file.
-	quotaState quotaStateWriter
+	managerQuota
 
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider

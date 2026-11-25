@@ -44,3 +44,9 @@ func (cfg *Config) ValidateClaudeFallbackWhen() error {
 	}
 	return nil
 }
+
+// fallback-when is a shared v8 key-group field: a group may set it for all its keys
+// (Claude groups only; expandV8Groups refuses it elsewhere).
+func init() {
+	sharedKeyFields["fallback-when"] = true
+}

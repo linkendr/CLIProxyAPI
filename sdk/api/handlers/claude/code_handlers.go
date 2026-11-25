@@ -553,11 +553,12 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStreamWithState(c *gin.Context, flus
 }
 
 type claudeErrorDetail struct {
-	Type         string              `json:"type"`
-	Message      string              `json:"message"`
-	ResetTime    string              `json:"reset_time,omitempty"`
-	ResetSeconds *int64              `json:"reset_seconds,omitempty"`
-	Details      *claudeErrorDetails `json:"details,omitempty"`
+	Type    string              `json:"type"`
+	Message string              `json:"message"`
+	Details *claudeErrorDetails `json:"details,omitempty"`
+
+	ResetTime    string `json:"reset_time,omitempty"`
+	ResetSeconds *int64 `json:"reset_seconds,omitempty"`
 }
 
 type claudeErrorDetails struct {
@@ -654,15 +655,10 @@ func (h *ClaudeCodeAPIHandler) WriteErrorResponse(c *gin.Context, msg *interface
 	if msg != nil && msg.Error != nil {
 		safeHeaders := coreauth.SafeResponseHeaders(msg.Error)
 		retryAfter = safeHeaders.Get("Retry-After")
-		for key, values := range safeHeaders {
-			if !coreauth.IsRateLimitResponseHeader(key) {
-				continue
-			}
-			c.Writer.Header().Del(key)
-			for _, value := range values {
-				c.Writer.Header().Add(key, value)
-			}
+		for _, value := range safeHeaders.Values("Retry-After") {
+			c.Writer.Header().Add("Retry-After", value)
 		}
+		handlers.EchoRateLimitHeaders(c.Writer.Header(), safeHeaders)
 	}
 	if msg != nil && msg.Addon != nil && handlers.PassthroughHeadersEnabled(h.CurrentConfig()) {
 		for key, values := range msg.Addon {
@@ -705,25 +701,6 @@ func claudeErrorText(err error) string {
 		return string(responseBody.ResponseBody())
 	}
 	return err.Error()
-}
-
-// claudeErrorResetFromText keeps the proxy cooldown's reset_time and
-// reset_seconds so clients can still tell when to retry.
-func claudeErrorResetFromText(errText string) (string, *int64) {
-	if !ojson.Valid(errText) {
-		return "", nil
-	}
-	node := ojson.Get(errText, "error")
-	if !node.IsObject() {
-		return "", nil
-	}
-	resetTime := strings.TrimSpace(node.Get("reset_time").String())
-	seconds := node.Get("reset_seconds")
-	if seconds.Type != ojson.Number {
-		return resetTime, nil
-	}
-	value := seconds.Int()
-	return resetTime, &value
 }
 
 func claudeErrorDetailFromText(status int, errText string) (string, string) {

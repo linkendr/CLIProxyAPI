@@ -11,7 +11,6 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -1277,15 +1276,14 @@ func openAICompatStreamDataError(payload []byte, eventName string) (statusErr, b
 }
 
 type statusErr struct {
-	code             int
-	msg              string
-	cause            error
-	retryAfter       *time.Duration
-	requestScoped    bool
-	credentialScoped bool
-	// rateLimitHeaders holds the allowlisted upstream 429 headers (Retry-After
-	// and anthropic-ratelimit-*) that the handler layer may echo to the client.
-	rateLimitHeaders   http.Header
+	statusErrRateLimit
+
+	code               int
+	msg                string
+	cause              error
+	retryAfter         *time.Duration
+	requestScoped      bool
+	credentialScoped   bool
 	streamTruncated    bool
 	transientRateLimit bool
 	transientTransport bool
@@ -1302,22 +1300,11 @@ func (e statusErr) Error() string {
 	}
 	return fmt.Sprintf("status %d", e.code)
 }
-func (e statusErr) Unwrap() error { return e.cause }
-
-// Is compares by value: the rateLimitHeaders map makes statusErr incomparable
-// with ==, which would otherwise break errors.Is against a wrapped statusErr cause.
-func (e statusErr) Is(target error) bool {
-	t, ok := target.(statusErr)
-	return ok && reflect.DeepEqual(e, t)
-}
-
+func (e statusErr) Unwrap() error              { return e.cause }
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
 func (e statusErr) IsRequestScoped() bool      { return e.requestScoped }
 func (e statusErr) IsCredentialScoped() bool   { return e.credentialScoped }
-
-// UpstreamRateLimitHeaders returns the allowlisted upstream rate-limit headers.
-func (e statusErr) UpstreamRateLimitHeaders() http.Header { return e.rateLimitHeaders }
 
 // LogDiagnostic lets upstream failure logs explain a sanitized client message.
 func (e statusErr) LogDiagnostic() string { return e.diagnostic }

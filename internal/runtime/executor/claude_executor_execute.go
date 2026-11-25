@@ -250,12 +250,10 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	applyClaudePreservedThinkingBindingDoc(doc)
 	// Keep built-in cleanup before the final user payload rules.
 	stripPromptCacheOptionsDoc(doc)
-	// The reserve gate's wrap-up note is the last built-in injection, so no later rewrite
-	// moves it off the end of the last user message; the user rules below still win.
+	// User rules match the fully prepared business body and are applied only once.
 	if errNote := helps.ApplyClaudeReserveWindDownNoteDoc(doc, auth, opts.Metadata); errNote != nil {
 		return resp, fmt.Errorf("append reserve wind-down note: %w", errNote)
 	}
-	// User rules match the fully prepared business body and are applied only once.
 	touchedPayloadPaths := helps.ApplyPayloadConfigWithTrackedPathsDoc(
 		e.cfg, baseModel, to.String(), from.String(), "", doc, stripTranslatedDefaultMaxTokens(from, originalPayload, originalTranslated),
 		helps.PayloadRequestedModel(opts, req.Model), helps.PayloadRequestPath(opts), opts.Headers,

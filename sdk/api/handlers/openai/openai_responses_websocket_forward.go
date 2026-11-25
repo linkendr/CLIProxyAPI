@@ -765,14 +765,6 @@ func websocketJSONPayloadsFromChunk(chunk []byte) [][]byte {
 	return payloads
 }
 
-// capWebsocketRetryAfter applies the configured client Retry-After cap to a websocket error header.
-func capWebsocketRetryAfter(key, value string) string {
-	if http.CanonicalHeaderKey(key) != "Retry-After" {
-		return value
-	}
-	return handlers.CapClientRetryAfter(value)
-}
-
 func buildResponsesWebsocketErrorPayload(errMsg *interfaces.ErrorMessage) ([]byte, error) {
 	status := http.StatusInternalServerError
 	errText := http.StatusText(status)

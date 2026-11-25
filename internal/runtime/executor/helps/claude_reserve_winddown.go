@@ -11,8 +11,11 @@ import (
 // user message of doc when the gate served the request only to let a running task finish.
 // Appending a text block after the existing blocks (the tool results) keeps every byte
 // before it, so the cached prompt prefix and the caller's cache_control markers stay as
-// they were; the system prompt is not touched. It is a built-in injection: call it before
-// the user payload rules, which stay the last word on the body.
+// they were; the system prompt is not touched. It is a built-in injection: the Claude
+// executors call it last among the built-in steps, so no later rewrite moves it off the
+// end of the last user message, and before the user payload rules, which stay the last
+// word on the body. The call sits below upstream's "User rules" comment, away from the
+// end of the built-in chain, where upstream adds its own steps.
 func ApplyClaudeReserveWindDownNoteDoc(doc *ojson.Doc, auth *cliproxyauth.Auth, metadata map[string]any) error {
 	if !cliproxyauth.ReserveWindDownNoteApplies(auth, metadata) {
 		return nil

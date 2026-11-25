@@ -104,19 +104,14 @@ const (
 )
 
 type modelCooldownError struct {
+	namedQuotaLimit
+
 	model          string
 	resetIn        time.Duration
 	provider       string
 	cause          error
 	claudeCooldown bool
 	claudeSignals  map[string]string
-	// limited is set when a cooled Max login is behind the refusal (nameQuotaRefusal):
-	// the message then names limit ("" if unknown) and its reset limitResetAt, as seen
-	// at now.
-	limited      bool
-	limit        string
-	limitResetAt time.Time
-	now          time.Time
 }
 
 // NewModelCooldownError creates an error representing model-level cooldown.
@@ -170,9 +165,7 @@ func (e *modelCooldownError) Error() string {
 	if e.provider != "" {
 		message = fmt.Sprintf("%s via provider %s", message, e.provider)
 	}
-	if e.limited {
-		message = quotaRefusalSentence(e.limit, e.limitResetAt, time.Local) + quotaRefusalCountdown(e.limitResetAt, e.now)
-	}
+	message = e.limitMessage(message)
 	resetSeconds := int(math.Ceil(e.resetIn.Seconds()))
 	if resetSeconds < 0 {
 		resetSeconds = 0
@@ -406,31 +399,15 @@ func (e *modelCooldownError) resetSeconds() int64 {
 	return seconds
 }
 
-// SafeResponseHeaders exposes only the locally trusted cooldown headers. A refusal that
-// names the limit of a Max login (limited) also carries the unified headers a Claude
-// Code session with a subscription login reads the reset from: they reach the client
-// whatever passthrough-headers says.
+// SafeResponseHeaders exposes only the locally trusted cooldown headers.
 func (e *modelCooldownError) SafeResponseHeaders() http.Header {
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/json")
 	headers.Set("Retry-After", strconv.FormatInt(e.resetSeconds(), 10))
-	if e != nil && e.limited {
-		resetAt := e.limitResetAt
-		if resetAt.IsZero() {
-			resetAt = time.Now().Add(e.resetIn)
-		}
-		headers.Set("anthropic-ratelimit-unified-status", "rejected")
-		headers.Set("anthropic-ratelimit-unified-reset", strconv.FormatInt(resetAt.Unix(), 10))
-		if claim := quotaRefusalClaim(e.limit); claim != "" {
-			headers.Set("anthropic-ratelimit-unified-representative-claim", claim)
-		}
-	}
+	e.setLimitHeaders(headers)
 	return headers
 }
 
-// Headers adds the unified headers upstream synthesizes for a Claude cooldown. A limited
-// refusal keeps the headers of its named limit: its reset is the Max login's, not the
-// route's.
 func (e *modelCooldownError) Headers() http.Header {
 	headers := e.SafeResponseHeaders()
 	if e != nil && !e.limited && e.claudeCooldown && e.resetIn > 0 {

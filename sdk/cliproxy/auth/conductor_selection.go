@@ -925,14 +925,7 @@ func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, pro
 }
 
 func (m *Manager) availableAuthsForRouteModelForRequest(ctx context.Context, auths []*Auth, provider, routeModel string, now time.Time, allPriorities bool, clientHeaders ...http.Header) ([]*Auth, error) {
-	if len(auths) == 0 {
-		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
-	}
-
-	// A conditional fallback that is not eligible behaves as if it were not configured,
-	// so the error below reflects only the credentials that can actually serve the model.
-	auths = m.filterConditionalFallbacks(auths, routeModel, now)
-	if len(auths) == 0 {
+	if auths = m.filterConditionalFallbacks(auths, routeModel, now); len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
 
@@ -1039,35 +1032,8 @@ func (m *Manager) availableAuthsForSelector(ctx context.Context, selector Select
 	return priorityAuths, selectorAuths, nil
 }
 
-// usesPrevalidatedCandidates reports whether the selector receives manager-validated
-// candidates and an empty model, like the built-in selectors. The weekly-window selectors
-// (EarliestResetSelector, PaceSelector) join them for candidate handling but not the
-// scheduler fast path, which has no reset or pace ordering.
-func usesPrevalidatedCandidates(selector Selector) bool {
-	if isWeeklyWindowSelector(selector) {
-		return true
-	}
-	return isBuiltInSelector(selector)
-}
-
-// isWeeklyWindowSelector reports whether the selector ranks by the requested model's
-// weekly quota windows.
-func isWeeklyWindowSelector(selector Selector) bool {
-	switch selector.(type) {
-	case *EarliestResetSelector, *PaceSelector:
-		return true
-	default:
-		return false
-	}
-}
-
 func selectionArgForSelector(selector Selector, routeModel string) string {
-	// The weekly-window selectors read the requested model's quota data, so they get the
-	// model. Candidates are still prevalidated via selectorContextForAvailableAuths.
-	if isWeeklyWindowSelector(selector) {
-		return routeModel
-	}
-	if usesPrevalidatedCandidates(selector) {
+	if isBuiltInSelector(selector) {
 		return ""
 	}
 	return routeModel
@@ -1091,8 +1057,6 @@ func (m *Manager) transientlyUnavailableSessionAffinityAuthIDs(ctx context.Conte
 	if !ok || affinity == nil || (!affinity.rebindOnQuotaOnly && !affinity.rebindOnNever) || len(affinityCandidates) == 0 {
 		return nil
 	}
-	// An ineligible conditional fallback is not a candidate, so a stale binding to it
-	// must not be preserved as "transiently unavailable".
 	affinityCandidates = m.filterConditionalFallbacks(affinityCandidates, routeModel, now)
 	if _, weighted := affinity.fallback.(*WeightedRoundRobinSelector); weighted {
 		affinityCandidates = positiveWeightAuths(affinityCandidates)
@@ -2426,15 +2390,10 @@ func (m *Manager) advanceSyncedVersion(version uint64) {
 }
 
 func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) bool {
-	if auth == nil {
-		return false
-	}
-	// Conditional fallbacks need the manager-level view of their higher-priority peers,
-	// which the scheduler fast path does not have.
 	if authFallbackWhenModelLimit(auth) {
 		return true
 	}
-	if strings.TrimSpace(routeModel) == "" {
+	if auth == nil || strings.TrimSpace(routeModel) == "" {
 		return false
 	}
 	if m.usesPublishedModelRoutes(auth) {
@@ -2478,9 +2437,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
-	reserve := m.reserveCheckFor(opts)
-	creditWithheld := m.reserveWithholdsCredit(opts.Metadata)
-	var reserveGated []*Auth
+	reserve := m.beginReserveSelection(opts)
 	pluginScheduler, schedulerAcross := m.snapshotPluginScheduler()
 
 	m.mu.RLock()
@@ -2526,23 +2483,15 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
-		if creditWithheld && isClaudeCreditKey(candidate) {
-			continue
-		}
 		_, used := tried[candidate.ID]
-		gated := reserve.blocks(candidate)
-		// Pinning restricts selection, not the eligible pool used for accounting;
-		// the reserve gate does shrink that pool, as it does for unpinned requests.
-		if trackPinnedAccounting && !used && !gated {
+		// Pinning restricts selection, not the eligible pool used for accounting.
+		if !reserve.excludes(candidate) && trackPinnedAccounting && !used {
 			accountingCandidates = append(accountingCandidates, candidate)
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
-		if gated {
-			if !used {
-				reserveGated = append(reserveGated, candidate)
-			}
+		if reserve.skips(candidate, used) {
 			continue
 		}
 		if trackTransientAffinity {
@@ -2554,8 +2503,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		candidates = append(candidates, candidate)
 	}
 	canInspectUnavailableAffinity := hasAffinity && affinitySelector != nil && affinitySelector.rebindOnNever && pluginScheduler == nil
-	if len(candidates) == 0 && len(reserveGated) > 0 {
-		errHold := reserve.holdError(reserveGated)
+	if errHold := reserve.emptyPoolError(candidates); errHold != nil {
 		m.mu.RUnlock()
 		return nil, nil, errHold
 	}
@@ -2853,8 +2801,6 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
 	}
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
-	// The scheduler does not know the reserve gate: a request it would affect takes the
-	// legacy path, which filters the candidates.
 	reserve := m.reserveCheckFor(opts)
 	targetKey := canonicalSchedulingProvider(provider)
 	if strings.TrimSpace(model) != "" || targetKey == "codex" || reserve != nil {
@@ -2982,9 +2928,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
-	reserve := m.reserveCheckFor(opts)
-	creditWithheld := m.reserveWithholdsCredit(opts.Metadata)
-	var reserveGated []*Auth
+	reserve := m.beginReserveSelection(opts)
 
 	providerSet := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
@@ -3046,23 +2990,15 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
-		if creditWithheld && isClaudeCreditKey(candidate) {
-			continue
-		}
 		_, used := tried[candidate.ID]
-		gated := reserve.blocks(candidate)
-		// Pinning restricts selection, not the eligible pool used for accounting;
-		// the reserve gate does shrink that pool, as it does for unpinned requests.
-		if trackPinnedAccounting && !used && !gated {
+		// Pinning restricts selection, not the eligible pool used for accounting.
+		if !reserve.excludes(candidate) && trackPinnedAccounting && !used {
 			accountingCandidates = append(accountingCandidates, candidate)
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
-		if gated {
-			if !used {
-				reserveGated = append(reserveGated, candidate)
-			}
+		if reserve.skips(candidate, used) {
 			continue
 		}
 		if trackTransientAffinity {
@@ -3074,8 +3010,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		candidates = append(candidates, candidate)
 	}
 	canInspectUnavailableAffinity := hasAffinity && affinitySelector != nil && affinitySelector.rebindOnNever && pluginScheduler == nil
-	if len(candidates) == 0 && len(reserveGated) > 0 {
-		errHold := reserve.holdError(reserveGated)
+	if errHold := reserve.emptyPoolError(candidates); errHold != nil {
 		m.mu.RUnlock()
 		return nil, nil, "", errHold
 	}
@@ -3203,50 +3138,6 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	return authCopy, executor, providerKey, nil
 }
 
-// pickNextMixed selects the credential of one attempt. At a quota dead end, where no Max
-// login can serve the caller, it first reads the real usage of the Max logins
-// (refreshQuotaUsage) and selects once more if that lifted a cooldown or changed a
-// reading: a limit the owner reset upstream is then seen without a manual step. A
-// cooldown refusal behind a cooled Max login names the limit and its reset. Home owns
-// the credentials under Home dispatch, so nothing is read there.
-func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
-	auth, executor, provider, errPick := m.pickNextMixedOnce(ctx, providers, model, opts, tried)
-	if m.HomeEnabled() || !quotaDeadEnd(auth, providers, errPick) {
-		return auth, executor, provider, errPick
-	}
-	if m.refreshQuotaUsage(ctx) {
-		auth, executor, provider, errPick = m.pickNextMixedOnce(ctx, providers, model, opts, tried)
-	}
-	now := time.Now()
-	errPick = m.nameQuotaRefusal(errPick, model, now)
-	m.syncQuotaState(now)
-	return auth, executor, provider, errPick
-}
-
-// quotaDeadEnd reports whether a selection ended where no Max login can serve the
-// caller: a reserve hold refusal (not the manual hold, which no reading lifts), a
-// cooldown refusal on a route that includes Claude, or a Claude credit key
-// (fallback-when) about to serve.
-func quotaDeadEnd(selected *Auth, providers []string, errPick error) bool {
-	if errPick == nil {
-		return selected != nil && isClaudeAuth(selected) && authFallbackWhen(selected) != ""
-	}
-	var holdErr *reserveHoldError
-	if errors.As(errPick, &holdErr) && holdErr != nil {
-		return !holdErr.manual
-	}
-	var cooldownErr *modelCooldownError
-	if !errors.As(errPick, &cooldownErr) || cooldownErr == nil {
-		return false
-	}
-	for _, provider := range providers {
-		if canonicalSchedulingProvider(provider) == "claude" {
-			return true
-		}
-	}
-	return false
-}
-
 func (m *Manager) pickNextMixedOnce(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	opts.EnsureMetadata()
 	clearSchedulerSelectionID(opts.Metadata)
@@ -3280,8 +3171,6 @@ func (m *Manager) pickNextMixedOnce(ctx context.Context, providers []string, mod
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 	eligibility := authSelectionEligibilityForRequest(ctx, opts)
-	// The scheduler does not know the reserve gate: a request it would affect takes the
-	// legacy path, which filters the candidates.
 	reserve := m.reserveCheckFor(opts)
 	providerSet := make(map[string]struct{}, len(eligibleProviders))
 	for _, providerKey := range eligibleProviders {

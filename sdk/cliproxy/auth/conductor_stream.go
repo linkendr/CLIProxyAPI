@@ -1001,10 +1001,11 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			return nil, preferredExecutionAttemptError(currentErr, upstreamErr)
 		}
 
+		streamResult.Headers = m.withMaxPoolHeaders(auth, streamResult.Headers, time.Now())
 		attemptAliasResult := resolveAttemptAliasResult(routing, auth, routeModel, execModel, aliasResult)
 		handoffCancel := cancelAttempt
 		cancelAttempt = nil
-		return m.wrapStreamResultWithCancel(execCtx, auth.Clone(), provider, resultModel, routeModel, m.withMaxPoolHeaders(auth, streamResult.Headers, time.Now()), buffered, streamResult.Chunks, attemptAliasResult, ephemeralResult, execOpts, executionSeq, handoffCancel), nil
+		return m.wrapStreamResultWithCancel(execCtx, auth.Clone(), provider, resultModel, routeModel, streamResult.Headers, buffered, streamResult.Chunks, attemptAliasResult, ephemeralResult, execOpts, executionSeq, handoffCancel), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
