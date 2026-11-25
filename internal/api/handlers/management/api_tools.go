@@ -233,6 +233,7 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
+	respBody = withAPICredits(c.GetBool(ConfigV8ContextKey), auth, method, parsedURL, resp.StatusCode, respBody, time.Now())
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header,
