@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -67,6 +68,30 @@ func (m *Manager) HomeDispatchBundle() *HomeDispatchBundle {
 		return nil
 	}
 	return m.homeDispatchBundle.Load()
+}
+
+// AuthorizeHomeLocalExecutor uses the currently attached Home lifetime for the
+// authorization and returns its validity check for the executor.
+func (m *Manager) AuthorizeHomeLocalExecutor(ctx context.Context, model string, headers http.Header, query url.Values) (home.LocalExecutorDecision, func() bool, error) {
+	bundle := m.HomeDispatchBundle()
+	if bundle == nil || !bundle.client.HeartbeatOK() {
+		return home.LocalExecutorDecision{}, nil, errors.New("home control center unavailable")
+	}
+	valid := func() bool { return m.HomeEnabled() && m.HomeDispatchBundle() == bundle && bundle.client.HeartbeatOK() }
+	client, ok := bundle.client.(interface {
+		AuthorizeLocalExecutor(context.Context, string, http.Header, url.Values) (home.LocalExecutorDecision, error)
+	})
+	if !ok {
+		return home.LocalExecutorDecision{Kind: "credential"}, valid, nil
+	}
+	decision, errAuthorize := client.AuthorizeLocalExecutor(ctx, model, headers, query)
+	if !valid() {
+		return home.LocalExecutorDecision{}, nil, errors.New("home control center unavailable")
+	}
+	if errAuthorize == nil && decision.Kind == home.LocalExecutorDispatchKind && decision.Error == nil {
+		setHomeUserAPIKeyOnGinContext(ctx, decision.Principal)
+	}
+	return decision, valid, errAuthorize
 }
 
 // SetHomeExecutionRegistry preserves the legacy registry API for callers that also install the current dispatcher.
@@ -888,11 +913,18 @@ func (m *Manager) replaceHomeSelectionAuth(selection *HomeDispatchSelection, aut
 		return
 	}
 	for sessionID, owners := range m.homeRuntimeAuthOwners {
+		sessionAuths := m.homeRuntimeAuths[sessionID]
+		if sessionAuths == nil {
+			continue
+		}
 		for authID, owner := range owners {
-			if owner != selection || m.homeRuntimeAuths[sessionID] == nil {
+			if owner != selection {
 				continue
 			}
-			m.homeRuntimeAuths[sessionID][authID] = updated.Clone()
+			if existing, exists := sessionAuths[authID]; !exists || existing == nil {
+				continue
+			}
+			sessionAuths[authID] = updated.Clone()
 		}
 	}
 	m.mu.Unlock()
@@ -1478,16 +1510,21 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 			continue
 		}
 		candidates = append(candidates, creditsCandidateEntry{
-			auth:     auth.Clone(),
-			executor: executor,
-			provider: providerKey,
+			auth:        auth.Clone(),
+			executor:    executor,
+			provider:    providerKey,
+			targetModel: targetModel,
 		})
 	}
 	m.mu.RUnlock()
 
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	var known []creditsCandidateEntry
 	var unknown []creditsCandidateEntry
 	for _, candidate := range candidates {
+		if !antigravityCreditsAllowsCandidateModel(ctx, candidate.auth, routeModel, candidate.targetModel, opts, cfg, now) {
+			continue
+		}
 		hint, okHint, errHint := GetAntigravityCreditsHintForAuthRequired(ctx, candidate.auth)
 		if errHint != nil {
 			return nil, antigravityCreditsKVUnavailableError(errHint)
@@ -1515,9 +1552,10 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 }
 
 type creditsCandidateEntry struct {
-	auth     *Auth
-	executor ProviderExecutor
-	provider string
+	auth        *Auth
+	executor    ProviderExecutor
+	provider    string
+	targetModel string
 }
 
 func hasAntigravityProvider(providers []string) bool {
@@ -1879,17 +1917,23 @@ func shouldAttemptAntigravityCreditsFallback(m *Manager, lastErr error, provider
 	}
 	switch status {
 	case http.StatusTooManyRequests:
-		return isAntigravityCreditsQuota429(lastErr, retryAfterFromError(lastErr))
+		retryAfter := retryAfterFromError(lastErr)
+		var cooldownErr *modelCooldownError
+		if errors.As(lastErr, &cooldownErr) && cooldownErr != nil {
+			// A modelCooldownError wrapped in trustedRetryAfterError exposes the live
+			// remaining cooldown rather than the original upstream retry hint; defer to
+			// any hint carried by the underlying cause so credits admission uses the
+			// stored upstream hint instead of mistaking final countdown minutes for a
+			// short transient rate limit.
+			retryAfter = retryAfterFromError(cooldownErr.Unwrap())
+		}
+		return isAntigravityCreditsQuota429(lastErr, retryAfter)
 	case http.StatusServiceUnavailable:
 		return isAntigravityCreditsCapacity503(lastErr)
 	case 0:
 		var authErr *Error
 		if errors.As(lastErr, &authErr) && authErr != nil {
 			return authErr.Code == "auth_not_found" || authErr.Code == "auth_unavailable" || authErr.Code == "model_cooldown"
-		}
-		var cooldownErr *modelCooldownError
-		if errors.As(lastErr, &cooldownErr) {
-			return true
 		}
 		return false
 	default:
@@ -1955,7 +1999,11 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 		return cliproxyexecutor.Response{}, false, nil
 	}
 	routeModel := req.Model
-	candidates, errCandidates := m.findAllAntigravityCreditsCandidateAuths(ctx, routeModel, opts)
+	candidateOpts := opts
+	if len(candidateOpts.OriginalRequest) == 0 && len(req.Payload) > 0 {
+		candidateOpts.OriginalRequest = req.Payload
+	}
+	candidates, errCandidates := m.findAllAntigravityCreditsCandidateAuths(ctx, routeModel, candidateOpts)
 	if errCandidates != nil {
 		return cliproxyexecutor.Response{}, false, errCandidates
 	}
@@ -2113,7 +2161,11 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		return nil, false, nil
 	}
 	routeModel := req.Model
-	candidates, errCandidates := m.findAllAntigravityCreditsCandidateAuths(ctx, routeModel, opts)
+	candidateOpts := opts
+	if len(candidateOpts.OriginalRequest) == 0 && len(req.Payload) > 0 {
+		candidateOpts.OriginalRequest = req.Payload
+	}
+	candidates, errCandidates := m.findAllAntigravityCreditsCandidateAuths(ctx, routeModel, candidateOpts)
 	if errCandidates != nil {
 		return nil, false, errCandidates
 	}
